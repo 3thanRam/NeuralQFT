@@ -1,0 +1,7 @@
+__pycache__
+*.txt
+*.pkl
+*.pt
+*.npy
+*.faiss
+*.json
