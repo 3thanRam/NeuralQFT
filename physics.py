@@ -29,25 +29,34 @@ def get_minkowski_action(phi, dx, M, g):
     return torch.sum(L_density, dim=(1,2,3,4)) * (dx**4)
 
 def get_theory_propagator(L, dx, M, theta):
-    """Unified Analytic Continuation for Propagator."""
-    n = torch.arange(L, dtype=torch.float64)
+    """
+    Unified Analytic Continuation for Propagator.
+    
+    FIXED: Correct Wick rotation formula
+    """
+    n = torch.arange(L, dtype=torch.float64)  
     k = 2.0 * np.pi * n / L
-    eigen = (4.0 / dx**2) * torch.sin(k / 2.0)**2
+    k_centered = torch.where(k.real <= np.pi, k, k - 2.0 * np.pi)
+    
+    # Lattice derivative eigenvalues
+    eigen = (2.0 / dx**2) * (1.0 - torch.cos(k_centered * dx))
     
     KT = eigen.view(L,1,1,1)
     KX = eigen.view(1,L,1,1)
     KY = eigen.view(1,1,L,1)
     KZ = eigen.view(1,1,1,L)
     
-    # Metric signature rotation
-    # At theta=0: (+,+,+,+) Euclidean
-    # At theta=pi/2: (-,+,+,+) Minkowski  
-    K_time = KT * torch.cos(torch.tensor(2*theta)) - 1j * KT * torch.sin(torch.tensor(2*theta))
+    rotation_factor = torch.exp(torch.tensor(2j * theta, dtype=torch.complex128))
+    K_time = KT * rotation_factor
     K_spatial = KX + KY + KZ
     
-    epsilon = 1e-6
+    # Propagator
+    epsilon = 1e-8
     denominator = K_time + K_spatial + M**2 + 1j*epsilon
     G_k = 1.0 / denominator
     
-    G_x = torch.fft.ifftn(G_k)
-    return G_x.numpy()* (1.0 / dx**4)
+    # Transform to position space
+    G_x = torch.fft.ifftn(G_k, dim=(0,1,2,3))
+    
+    # Normalization: keep your original for now
+    return G_x.cpu().numpy() * (1.0 / dx**4)
