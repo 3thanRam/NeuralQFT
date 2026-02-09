@@ -2,5 +2,5 @@
 
 WIP
 
-Path integral guided my neural network
+Path integral guided by neural network
 

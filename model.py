@@ -42,7 +42,6 @@ class FourierScaleFlow(nn.Module):
                eigen.view(1,1,L,1) + eigen.view(1,1,1,L))
         
         G_k = 1.0 / (Lap + M**2)
-        # Correct Scaling initialization
         target_log_scales = 0.5 * torch.log(G_k) - 2.0 * np.log(dx)
         self.log_scales_4d = nn.Parameter(target_log_scales)
     
@@ -103,7 +102,7 @@ class ExactQFTFlow(nn.Module):
 
         log_det_coupling = 0
         for layer in self.coupling_layers:
-            x, ld = layer(x, theta_val)  # Pass theta to each layer
+            x, ld = layer(x, theta_val)  
             log_det_coupling = log_det_coupling + ld
         
         phi, log_det_wick, theta = self.wick(x, force_theta=force_theta)

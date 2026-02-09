@@ -16,7 +16,6 @@ class QFTExperiment:
     def __init__(self, config):
         self.cfg = config
         self.model = ExactQFTFlow(config).to(config['device'])
-        # Start with higher LR for Euclidean phase
         self.optimizer = optim.Adam(self.model.parameters(), lr=config['lr'])
         print(f"Initialized QFT Flow on {config['device']}")
 
@@ -40,7 +39,7 @@ class QFTExperiment:
     def finetune_step(self,epoch):
         self.optimizer.zero_grad()
 
-        max_theta = min(1.57, 0.3 + epoch * 0.003)  # Reach π/2 by epoch ~400
+        max_theta = min(1.57, 0.3 + epoch * 0.003)  
     
         if np.random.rand() < 0.3:
             theta_target = np.random.uniform(max(0, max_theta - 0.5), max_theta)
@@ -75,14 +74,12 @@ class QFTExperiment:
         print("\n=== PHYSICS CHECK: FLOW vs MCMC (EUCLIDEAN) ===")
         self.model.eval()
         
-        # 1. Flow Stats
         z = torch.randn(1000, self.cfg['L'], self.cfg['L'], 
                        self.cfg['L'], self.cfg['L'], device=self.cfg['device'])
         with torch.no_grad():
             phi, log_det, _ = self.model(z, force_theta=0.0)
             phi = phi.real
         
-        # Robust Reweighting (LogSumExp)
         S = get_euclidean_action(phi, self.cfg['dx'], self.cfg['M'], self.cfg['g'])
         log_q = -0.5 * torch.sum(z**2, dim=(1,2,3,4)) - log_det.real
         log_w = -S - log_q
@@ -100,7 +97,6 @@ class QFTExperiment:
         
         print(f"[FLOW] <φ²>={phi2_flow:.4f}, U_L={U_L_flow:.4f}")
         
-        # 2. MCMC Stats
         mcmc = MCMC_Checkerboard(self.cfg)
         phi2_mc, phi4_mc = mcmc.run_simulation(n_samples=200)
         U_L_mc = 1.0 - phi4_mc / (3.0 * phi2_mc**2)
@@ -125,7 +121,6 @@ class QFTExperiment:
                 phi, _, _ = self.model(z, force_theta=theta_target)
                 phi_cpu = phi.cpu().to(torch.complex128)
 
-                # Simple unweighted average
                 phi_0 = phi_cpu[:, 0:1, 0:1, 0:1, 0:1]
                 G_sum += torch.sum(phi_cpu * phi_0, dim=0)
         with torch.no_grad():
@@ -274,7 +269,6 @@ class QFTExperiment:
         plt.savefig(self.cfg['data_dir']/'error_vs_theta.png', dpi=150)
         print(f"\nSaved error analysis to {self.cfg['data_dir']/'error_vs_theta.png'}")
 
-        # Replace the propagator comparison plotting section with:
 
         fig2, axes2 = plt.subplots(2, 2, figsize=(12, 10))
 

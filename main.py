@@ -8,12 +8,12 @@ from experiment import QFTExperiment
 # CONFIGURATION
 # ==============================================================================
 CONFIG = {
-    'L': 12,
+    'L': 10,
     'dim': 4,
     'dx': 0.5,
     'M': 1.0,
     'g': 0.01,
-    'batch_size': 64,    # Smaller batch for stability
+    'batch_size': 64,
     'n_layers': 8,       
     'hidden_dim': 48,    
     'pretrain_epochs': 500, 
