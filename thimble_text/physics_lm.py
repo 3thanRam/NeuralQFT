@@ -4,13 +4,36 @@ import numpy as np
 import sys
 from pathlib import Path
 
-sys.path.insert(0,'/home/ethan/Documents/Code/github/NeuralQFT')
-sys.path.insert(0,'/home/ethan/Documents/Code/github/NeuralQFT/learned_thimble')
+project_dir=Path(__file__).parent.parent.resolve()
+sys.path.insert(0,str(project_dir))
+sys.path.insert(0,str(project_dir/'learned_thimble'))
 
 # Import your existing modules
 from learned_thimble.thimble import PhysicsInformedThimble, GeneralAction, PARAM_DIM
 from learned_thimble.run_thimble import CONFIG 
 
+class PhysicsToTokenCNN(nn.Module):
+    def __init__(self, L, vocab_size):
+        super().__init__()
+        # We treat the 4th dimension (Time) as channels
+        # Input: [Batch, Time_L, L, L, L]
+        self.conv_block = nn.Sequential(
+            nn.Conv3d(L, 16, kernel_size=3, padding=1),
+            nn.GELU(),
+            nn.Conv3d(16, 32, kernel_size=3, padding=1),
+            nn.Flatten(),
+            nn.Linear(32 * (L**3), 256),
+            nn.GELU(),
+            nn.Linear(256, vocab_size)
+        )
+
+    def forward(self, phi_complex):
+        # We split complex into Real/Imag or just use Magnitude
+        # Let's use Real and Imag as two separate inputs if you prefer,
+        # or just the Real part for the "Lattice structure"
+        x = phi_complex.real 
+        return self.conv_block(x)
+    
 class DifferentiableAction:
     """
     A tensor-only version of GeneralAction.
@@ -114,68 +137,72 @@ class ThimbleLayer(nn.Module):
         log_w = log_w.reshape(BatchSize, self.n_mc)
         max_log_w, _ = torch.max(log_w, dim=1, keepdim=True)
         w = torch.softmax(log_w - max_log_w, dim=1)
+        # 4. Compute Weighted Average Field
+        # phi is [Batch * n_mc, L, L, L, L]
+        phi_reshaped = phi.view(BatchSize, self.n_mc, self.L, self.L, self.L, self.L)
+        
+        # Multiply each MC sample by its weight and sum
+        # w_expanded: [Batch, n_mc, 1, 1, 1, 1]
+        w_exp = w.view(BatchSize, self.n_mc, 1, 1, 1, 1)
+        phi_avg = (phi_reshaped * w_exp).sum(dim=1) # Result: [Batch, L, L, L, L]
 
-        # 4. Compute Observables (Standard)
-        phi_flat = phi.reshape(BatchSize, self.n_mc, -1)
-        phi_re = torch.clamp(phi_flat.real, -20.0, 20.0)
-        phi_im = torch.clamp(phi_flat.imag, -20.0, 20.0)
-        phi_safe = torch.complex(phi_re, phi_im)
-        
-        obs_phi_mean = phi_safe.mean(dim=2)
-        exp_phi = (obs_phi_mean * w).sum(dim=1) 
-
-        obs_phi2 = (phi_safe**2).mean(dim=2)
-        exp_phi2 = (obs_phi2 * w).sum(dim=1)
-        
-        obs_phi4 = (phi_safe**4).mean(dim=2)
-        exp_phi4 = (obs_phi4 * w).sum(dim=1)
-
-        obs_phase = torch.exp(1j * S.imag).reshape(BatchSize, self.n_mc)
-        exp_phase = (obs_phase * w).sum(dim=1)
-
-        # 5. NEW: Advanced Observables (Kinetic & Correlation)
-        
-        # A. Kinetic Energy (Gradients)
-        # How "rough" is the field?
-        # We compute sum((phi - neighbor)^2) roughly via rolls
-        # We do this on the unflattened phi [B*N, L, L, L, L]
-        dx_phi = torch.roll(phi, -1, dims=-1) - phi
-        dy_phi = torch.roll(phi, -1, dims=-2) - phi
-        grad_sq = (dx_phi**2 + dy_phi**2) # Simplified kinetic term
-        
-        # Flatten and Average over lattice
-        grad_sq_flat = grad_sq.reshape(BatchSize, self.n_mc, -1).mean(dim=2)
-        
-        # Clamp complex parts
-        g_re = torch.clamp(grad_sq_flat.real, -50.0, 50.0)
-        g_im = torch.clamp(grad_sq_flat.imag, -50.0, 50.0)
-        grad_safe = torch.complex(g_re, g_im)
-        
-        exp_grad = (grad_safe * w).sum(dim=1)
-
-        # B. Nearest Neighbor Correlation
-        # <phi(x) * phi(x+1)>
-        # Distinguishes "Heavy" vs "Light" fields better than just phi^2
-        corr = phi * torch.roll(phi, 1, dims=-1)
-        corr_flat = corr.reshape(BatchSize, self.n_mc, -1).mean(dim=2)
-        
-        c_re = torch.clamp(corr_flat.real, -20.0, 20.0)
-        c_im = torch.clamp(corr_flat.imag, -20.0, 20.0)
-        corr_safe = torch.complex(c_re, c_im)
-        
-        exp_corr = (corr_safe * w).sum(dim=1)
-
-        # 6. Stack All Features (8 + 4 = 12 dims)
-        features = torch.stack([
-            exp_phi.real,  exp_phi.imag,
-            exp_phi2.real, exp_phi2.imag,
-            exp_phi4.real, exp_phi4.imag,
-            exp_phase.real, exp_phase.imag,
-            exp_grad.real, exp_grad.imag,    # NEW
-            exp_corr.real, exp_corr.imag     # NEW
-        ], dim=1) 
-        
-        return features
+        return phi_avg # Return the raw 4D field
+        ## 4. Compute Observables (Standard)
+        #phi_flat = phi.reshape(BatchSize, self.n_mc, -1)
+        #phi_re = torch.clamp(phi_flat.real, -20.0, 20.0)
+        #phi_im = torch.clamp(phi_flat.imag, -20.0, 20.0)
+        #phi_safe = torch.complex(phi_re, phi_im)
+        #
+        #obs_phi_mean = phi_safe.mean(dim=2)
+        #exp_phi = (obs_phi_mean * w).sum(dim=1) 
+        #obs_phi2 = (phi_safe**2).mean(dim=2)
+        #exp_phi2 = (obs_phi2 * w).sum(dim=1)
+        #
+        #obs_phi4 = (phi_safe**4).mean(dim=2)
+        #exp_phi4 = (obs_phi4 * w).sum(dim=1)
+        #obs_phase = torch.exp(1j * S.imag).reshape(BatchSize, self.n_mc)
+        #exp_phase = (obs_phase * w).sum(dim=1)
+        ## 5. NEW: Advanced Observables (Kinetic & Correlation)
+        #
+        ## A. Kinetic Energy (Gradients)
+        ## How "rough" is the field?
+        ## We compute sum((phi - neighbor)^2) roughly via rolls
+        ## We do this on the unflattened phi [B*N, L, L, L, L]
+        #dx_phi = torch.roll(phi, -1, dims=-1) - phi
+        #dy_phi = torch.roll(phi, -1, dims=-2) - phi
+        #grad_sq = (dx_phi**2 + dy_phi**2) # Simplified kinetic term
+        #
+        ## Flatten and Average over lattice
+        #grad_sq_flat = grad_sq.reshape(BatchSize, self.n_mc, -1).mean(dim=2)
+        #
+        ## Clamp complex parts
+        #g_re = torch.clamp(grad_sq_flat.real, -50.0, 50.0)
+        #g_im = torch.clamp(grad_sq_flat.imag, -50.0, 50.0)
+        #grad_safe = torch.complex(g_re, g_im)
+        #
+        #exp_grad = (grad_safe * w).sum(dim=1)
+        ## B. Nearest Neighbor Correlation
+        ## <phi(x) * phi(x+1)>
+        ## Distinguishes "Heavy" vs "Light" fields better than just phi^2
+        #corr = phi * torch.roll(phi, 1, dims=-1)
+        #corr_flat = corr.reshape(BatchSize, self.n_mc, -1).mean(dim=2)
+        #
+        #c_re = torch.clamp(corr_flat.real, -20.0, 20.0)
+        #c_im = torch.clamp(corr_flat.imag, -20.0, 20.0)
+        #corr_safe = torch.complex(c_re, c_im)
+        #
+        #exp_corr = (corr_safe * w).sum(dim=1)
+        ## 6. Stack All Features (8 + 4 = 12 dims)
+        #features = torch.stack([
+        #    exp_phi.real,  exp_phi.imag,
+        #    exp_phi2.real, exp_phi2.imag,
+        #    exp_phi4.real, exp_phi4.imag,
+        #    exp_phase.real, exp_phase.imag,
+        #    exp_grad.real, exp_grad.imag,    # NEW
+        #    exp_corr.real, exp_corr.imag     # NEW
+        #], dim=1) 
+        #
+        #return features
 
 # Monkey-patch PhysicsInformedThimble to accept tensor params
 def generate_free_field_tensor_params(self, z, p_tensor):
@@ -207,21 +234,16 @@ class LagrangianLanguageModel(nn.Module):
         
         self.thimble_layer = ThimbleLayer(thimble_model_path, config, n_mc_samples=16)
         
-        # Increased dims (12 now)
         self.norm = nn.LayerNorm(12)
         
-        # NEW: A small "Physics Interpreter" MLP
-        # Instead of a single Linear layer, give the model a chance to 
-        # mix the physical signals (e.g. "High Gradient" AND "Low Mass")
         self.interpreter = nn.Sequential(
             nn.Linear(12, 32),
             nn.GELU(),
             nn.Linear(32, vocab_size)
         )
-        
+        self.PhysToToken=PhysicsToTokenCNN(config['L'], vocab_size)
         self.config = config
 
-    # ... (_scale_params remains same as previous step) ...
     def _scale_params(self, raw):
         s = torch.sigmoid(raw)
         p = torch.zeros_like(s)
@@ -230,8 +252,8 @@ class LagrangianLanguageModel(nn.Module):
         p[:, 2] = 2.0 * s[:, 2] - 1.0   # g3
         p[:, 3] = 2.5 * s[:, 3] - 0.5   # g4
         p[:, 4] = 1.0 * s[:, 4] + 0.05  # g6
-        p[:, 5] = 0.0
-        p[:, 6] = 0.0 
+        p[:, 5] = 1.0 * s[:, 5] + 0.05  # g6
+        p[:, 6] = 1.0 * s[:, 6] + 0.05  # g6
         p[:, 7] = 1.5 * s[:, 7]         # mu
         return p
 
@@ -243,12 +265,12 @@ class LagrangianLanguageModel(nn.Module):
         raw_params = self.to_params(last_hidden)
         phys_params = self._scale_params(raw_params)
         
-        # Get 12 physical features
-        observables = self.thimble_layer(phys_params)
-        observables = self.norm(observables)
-        
-        # Interpret and Predict
-        logits = self.interpreter(observables)
+        phi_avg = self.thimble_layer(phys_params)
+        logits=self.PhysToToken(phi_avg)
+        #observables = self.norm(observables)
+        #
+        ## Interpret and Predict
+        #logits = self.interpreter(observables)
         
         return logits, phys_params
 

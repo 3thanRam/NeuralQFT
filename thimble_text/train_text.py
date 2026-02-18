@@ -5,7 +5,7 @@ from datasets import load_dataset
 import numpy as np
 from pathlib import Path
 import sys
-
+import sys
 # Ensure physics_lm is importable
 try:
     from physics_lm import LagrangianLanguageModel
@@ -13,110 +13,133 @@ except ImportError:
     print("❌ Could not import 'physics_lm.py'. Make sure it is in the same directory.")
     sys.exit(1)
 
-# ============================================================================
-# 1. Data Pipeline (Wikitext-2 Character Level)
-# ============================================================================
+project_dir=Path(__file__).parent.parent.resolve()
+sys.path.insert(0,str(project_dir))
+sys.path.insert(0,str(project_dir/'learned_thimble'))
 
-class CharDataset(Dataset):
-    def __init__(self, text, block_size):
+
+from learned_thimble.thimble import PhysicsInformedThimble, GeneralAction, PARAM_DIM
+from learned_thimble.run_thimble import CONFIG 
+
+
+from tokenizers import Tokenizer, models, trainers, pre_tokenizers
+from datasets import load_dataset
+
+from tokenizers import Tokenizer, models, trainers, pre_tokenizers, decoders
+from datasets import load_dataset
+import os
+
+def get_or_train_tokenizer(vocab_size=512, save_path="physics_bpe.json"):
+    if os.path.exists(save_path):
+        print(f"✅ Loading existing tokenizer from {save_path}")
+        return Tokenizer.from_file(save_path)
+
+    print(f"🔨 Training new BPE tokenizer (vocab_size={vocab_size})...")
+    # Load raw text from wikitext
+    raw_data = load_dataset("wikitext", "wikitext-2-raw-v1", split="train")
+    
+    # Initialize BPE
+    tokenizer = Tokenizer(models.BPE(unk_token="[UNK]"))
+    tokenizer.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
+    tokenizer.decoder = decoders.ByteLevel()
+
+    # Train
+    trainer = trainers.BpeTrainer(
+        vocab_size=vocab_size, 
+        special_tokens=["[UNK]", "[PAD]", "[SOS]", "[EOS]"]
+    )
+    
+    # We pass the generator of strings directly to the trainer
+    tokenizer.train_from_iterator(raw_data['text'], trainer=trainer)
+    tokenizer.save(save_path)
+    return tokenizer
+
+
+class BPEDataset(Dataset):
+    def __init__(self, text_list, block_size, tokenizer):
         self.block_size = block_size
+        self.tokenizer = tokenizer
+        self.vocab_size = tokenizer.get_vocab_size()
         
-        # Create character vocabulary from the text
-        # We limit to unique chars found in dataset
-        chars = sorted(list(set(text)))
-        self.vocab_size = len(chars)
-        self.stoi = { ch:i for i,ch in enumerate(chars) }
-        self.itos = { i:ch for i,ch in enumerate(chars) }
+        # Join list of strings and encode
+        full_text = "\n".join(text_list)
+        encoded = self.tokenizer.encode(full_text)
+        self.data = torch.tensor(encoded.ids, dtype=torch.long)
         
-        # Convert full text to integers
-        self.data = torch.tensor([self.stoi[c] for c in text], dtype=torch.long)
-        
-        print(f"✅ Data loaded. Length: {len(text)} chars.")
+        print(f"✅ BPE Data ready. Total tokens: {len(self.data)}")
         print(f"   Vocab size: {self.vocab_size}")
-        print(f"   Sample vocab: {''.join(chars[30:50])} ...")
 
     def __len__(self):
-        # We start at 0 and go up to len - block_size
         return len(self.data) - self.block_size
 
     def __getitem__(self, idx):
-        # Grab a chunk of text
         chunk = self.data[idx : idx + self.block_size + 1]
-        
-        # Input: tokens 0..N-1
-        # Target: tokens 1..N
         x = chunk[:-1]
-        y = chunk[-1] # predicting the NEXT token only (Many-to-One)
+        y = chunk[-1]
         return x, y
 
     def decode(self, indices):
-        return ''.join([self.itos[int(i)] for i in indices])
+        if torch.is_tensor(indices):
+            indices = indices.tolist()
+        return self.tokenizer.decode(indices)
 
-def get_wikitext_data(block_size=32, split="train"):
-    print(f"Downloading Wikitext-2 ({split})...")
-    # wikitext-2-raw-v1 keeps punctuation and case, which is better for char-level
+def get_wikitext_bpe_data(tokenizer, block_size=32, split="train"):
+    print(f"Fetching Wikitext-2 ({split}) for BPE...")
     dataset = load_dataset("wikitext", "wikitext-2-raw-v1", split=split)
-    
-    # Concatenate all lines into one massive string
-    text = "\n".join(dataset['text'])
-    return CharDataset(text, block_size)
+    # Filter out empty strings to keep it clean
+    text_list = [t for t in dataset['text'] if len(t.strip()) > 0]
+    return BPEDataset(text_list, block_size, tokenizer)
+
 
 # ============================================================================
 # 2. Generation Tool
 # ============================================================================
 
-def generate_text(model, dataset, device, start_str="The ", length=50):
+def generate_text(model, dataset, device, start_str="The ", length=30):
     model.eval()
     
-    # Encode start string
-    context_idx = [dataset.stoi.get(c, 0) for c in start_str]
+    # Encode start string using BPE
+    encoding = dataset.tokenizer.encode(start_str)
+    context_idx = encoding.ids
     context = torch.tensor(context_idx, dtype=torch.long).unsqueeze(0).to(device)
     
     generated = list(context_idx)
     last_params = None
 
     for _ in range(length):
-        # Crop context to block_size if needed
         input_seq = context[:, -dataset.block_size:]
         
         with torch.no_grad():
             logits, params = model(input_seq)
-            
-            # Sample from distribution
             probs = torch.softmax(logits, dim=1)
-            # Use multinomial sampling for variety
             next_token = torch.multinomial(probs, num_samples=1)
             
             context = torch.cat((context, next_token), dim=1)
             generated.append(next_token.item())
             last_params = params[0]
 
+    # Use the BPE decoder to turn IDs back into text
     text = dataset.decode(generated)
     return text, last_params
 
 # ============================================================================
 # 3. Main Training Loop
 # ============================================================================
-import sys
 
-sys.path.insert(0,'/home/ethan/Documents/Code/github/NeuralQFT')
-sys.path.insert(0,'/home/ethan/Documents/Code/github/NeuralQFT/learned_thimble')
 
-# Import your existing modules
-from learned_thimble.thimble import PhysicsInformedThimble, GeneralAction, PARAM_DIM
-from learned_thimble.run_thimble import CONFIG 
 
 
 def train():
     # --- Configuration ---
     BLOCK_SIZE = 32         # Context length
     BATCH_SIZE = 64         # Small batch size due to heavy Path Integral
-    EMBED_DIM  = 64
-    HIDDEN_DIM = 128
-    LR         = 1e-3
+    EMBED_DIM  = 256
+    HIDDEN_DIM = 512
+    LR         = 1e-4
     EPOCHS     = 3          # Wikitext is larger, 3 epochs is plenty for a demo
     DEVICE     = 'cuda' if torch.cuda.is_available() else 'cpu'
-    
+    VOCAB_SIZE = 4096 
+
     # Path to your pre-trained physics model
     # (Update this path if your folder structure is different)
     THIMBLE_PATH = CONFIG['data_dir'] /"universal_thimble_model.pt"
@@ -127,18 +150,15 @@ def train():
         print("   Please run 'train.py' first to learn the QFT manifold.")
         return
 
-    # --- Setup Data ---
-    # We use a subset/stride to make epochs faster for demonstration
-    # Wikitext is ~2MB of text.
-    full_dataset = get_wikitext_data(BLOCK_SIZE, split="train")
+    tokenizer = get_or_train_tokenizer(vocab_size=VOCAB_SIZE)
     
-    # Create DataLoader
-    train_loader = DataLoader(full_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=0)
+    # 2. Setup Data with BPE
+    full_dataset = get_wikitext_bpe_data(tokenizer, BLOCK_SIZE, split="train")
+    train_loader = DataLoader(full_dataset, batch_size=BATCH_SIZE, shuffle=True)
 
-    # --- Setup Model ---
-    print("\nInitializing Physics-Informed LM...")
+    # 3. Setup Model (Now with 512 output classes)
     model = LagrangianLanguageModel(
-        vocab_size=full_dataset.vocab_size,
+        vocab_size=full_dataset.vocab_size, # This is now 512
         embed_dim=EMBED_DIM,
         hidden_dim=HIDDEN_DIM,
         thimble_model_path=THIMBLE_PATH,
