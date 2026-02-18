@@ -1,0 +1,10 @@
+__pycache__
+*.png
+!data/conv_training.png
+!data/validation_summary.png
+*.txt
+*.pkl
+*.pt
+*.npy
+*.faiss
+*.json

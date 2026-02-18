@@ -12,18 +12,18 @@ CONFIG = {
     'L':                  8,
     'dx':                 1.0,
     'batch_size':         32,
-    'thimble_hidden_dim': 32,
+    'thimble_hidden_dim': 64,
     'n_epochs':           12000,
-    'lr':                 3e-4,
+    'lr':                 2e-4,
     'restart_period':     2000,   # CosineAnnealingWarmRestarts T_0
     'device':             'cuda' if torch.cuda.is_available() else 'cpu',
     # Parameter ranges for randomised training
-    'train_m2':           2.0,    # centre of m2 range (actual range is [0.5, 2.0])
-    'train_kin':          2.0,
-    'train_g3':           0.6,    # set nonzero for Z2-breaking theories
-    'train_g4':           1.0,    # maximum g4 in training distribution
-    'train_g6':           0.6,    # set nonzero for UV-stable theories
-    'train_mu':           0.6,    # set 0.3 to train on sign problem
+    'train_m2':           5.0,    # centre of m2 range (actual range is [0.5, 2.0])
+    'train_kin':          5.0,
+    'train_g3':           3.0,    # set nonzero for Z2-breaking theories
+    'train_g4':           4.0,    # maximum g4 in training distribution
+    'train_g6':           3.0,    # set nonzero for UV-stable theories
+    'train_mu':           3.0,    # set 0.3 to train on sign problem
     # I/O
     'data_dir':           Path(__file__).parent.resolve() / 'data',
 }

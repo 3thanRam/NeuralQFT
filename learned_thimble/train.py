@@ -22,6 +22,9 @@ def random_params(epoch: int, cfg: dict) -> LagrangianParams:
 
     m2 = float(np.random.uniform(0.5, 2.0))
 
+    kinetic_coeff_max=cfg.get('train_kin', 1.0) * min(1.0, max(0.0, (t - 0.7) / 0.3))
+    kinetic_coeff= float(np.random.uniform(0.05, kinetic_coeff_max)) if kinetic_coeff_max > 0.1 else 0.1
+
     g4_max = cfg.get('train_g4', 0.5) * min(1.0, max(0.0, (t - 0.15) / 0.35))
     g4 = float(np.random.uniform(0.0, g4_max)) if g4_max > 0 else 0.0
 
@@ -34,10 +37,15 @@ def random_params(epoch: int, cfg: dict) -> LagrangianParams:
     mu_max = cfg.get('train_mu', 0.0) * min(1.0, max(0.0, (t - 0.7) / 0.3))
     mu = float(np.random.uniform(0.0, mu_max)) if mu_max > 0 else 0.0
 
+    box_coeff_max=cfg.get('train_box_coeff', 0.0) * min(1.0, max(0.0, (t - 0.7) / 0.3))
+    box_coeff= float(np.random.uniform(0.0, box_coeff_max)) if box_coeff_max > 0 else 0.0
+
+    deriv_interact_max=cfg.get('train_deriv_interact', 0.0) * min(1.0, max(0.0, (t - 0.7) / 0.3))
+    deriv_interact= float(np.random.uniform(0.0, deriv_interact_max)) if deriv_interact_max > 0 else 0.0
     return LagrangianParams(
-        m2=m2, kinetic_coeff=cfg.get('train_kin', 1.0),
+        m2=m2, kinetic_coeff=kinetic_coeff,
         g3=g3, g4=g4, g6=g6,
-        box_coeff=0.0, deriv_interact=0.0, mu=mu,
+        box_coeff=box_coeff, deriv_interact=deriv_interact, mu=mu,
     )
 
 
