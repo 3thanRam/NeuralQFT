@@ -15,7 +15,7 @@ Loss terms
                   ESS < 0.05 means importance weights have collapsed —
                   the thimble contour is far from the true saddle point.
 """
-
+import os
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
@@ -37,19 +37,19 @@ from physics_lm import MinkowskiFieldLM
 
 TRAIN_CONFIG = {
     'vocab_size':    50257,
-    'embed_dim':     256,
-    'n_quanta':      512,
-    'n_layers':      4,
+    'embed_dim':     512,
+    'n_quanta':      256,
+    'n_layers':      12,
     'block_size':    64,
     'batch_size':    16,    # small: thimble adds memory overhead
-    'lr':            1e-4,
+    'lr':            1e-2,
     'epochs':        3,
     'device':        'cuda' if torch.cuda.is_available() else 'cpu',
     'thimble_path':  THIMBLE_CONFIG['data_dir'] / 'minkowski_thimble.pt',
     'save_path':     THIMBLE_CONFIG['data_dir'] / 'minkowski_lm.pt',
     # Loss weights
-    'w_commit':      0.1,
-    'w_sign':        0.05,   # sign problem penalty weight
+    'w_commit':      10.0,
+    'w_sign':        1.0,   # sign problem penalty weight
     'w_ess':         0.1,    # ESS penalty weight
     # ESS floor: below this we consider the thimble to have failed
     'ess_floor':     0.05,
@@ -66,26 +66,48 @@ def get_tokenizer():
     return tok
 
 
+
 class WikiDataset(Dataset):
-    def __init__(self, tokenizer, block_size: int, split: str = 'train'):
+    def __init__(self, tokenizer, block_size: int, split: str = 'train', 
+                 cache_file='wiki_cache.pt'):
+        self.block_size = block_size
+        
+        # 1. Check if we have already processed the data
+        if os.path.exists(cache_file):
+            print(f"⚡ Loading cached dataset from {cache_file}...")
+            self.data = torch.load(cache_file)
+            print(f"✅ Loaded {len(self.data):,} tokens.")
+            return
+
+        print("🐢 Cache not found. Processing dataset (this happens once)...")
         raw = load_dataset('wikitext', 'wikitext-103-raw-v1', split=split)
 
         cleaned = []
+        # optimization: Pre-bind isalpha to avoid lookup overhead
         for t in raw['text']:
             t = t.strip()
-            if not t:                               continue
-            if t.startswith('='):                   continue
-            if t.startswith('<'):                   continue
-            if '@' in t:                            continue   # @-@ artifacts
-            if len(t.split()) < 8:                  continue
-            alpha = sum(c.isalpha() for c in t) / (len(t) + 1e-8)
-            if alpha < 0.4:                         continue
+            if not t: continue
+            if t.startswith('=') or t.startswith('<') or '@' in t: continue
+            if len(t.split()) < 8: continue
+            
+            # optimization: faster alpha check
+            # (or just remove this check if you want speed)
+            if len(t) > 0:
+                alpha = sum(c.isalpha() for c in t) / len(t)
+                if alpha < 0.4: continue
+            
             cleaned.append(t)
 
+        print("   Tokenizing...")
         full   = '\n'.join(cleaned)
+        # release raw memory
+        del raw 
+        
         enc    = tokenizer(full, return_tensors='pt', truncation=False)
-        self.data       = enc['input_ids'].squeeze(0)
-        self.block_size = block_size
+        self.data = enc['input_ids'].squeeze(0)
+        
+        print(f"💾 Saving cache to {cache_file}...")
+        torch.save(self.data, cache_file)
         print(f"✅ Tokens: {len(self.data):,}")
 
     def __len__(self):
@@ -93,11 +115,6 @@ class WikiDataset(Dataset):
 
     def __getitem__(self, idx):
         return self.data[idx: idx + self.block_size + 1]
-
-    def decode(self, ids):
-        if torch.is_tensor(ids):
-            ids = ids.tolist()
-        return self._tokenizer.decode(ids, skip_special_tokens=True)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -227,7 +244,7 @@ def train():
                     f"SignVar={sign_loss.item():.4f} | "
                     f"ESS={ess:.3f} | "
                     f"Perp={perplexity.item():.0f}/{cfg['n_quanta']}\n"
-                    f"   m²={p['m2']:.4f} g4={p['g4']:.4f} "
+                    f"   m²={p['m2']:.4f} g3={p['g3']:.4f} g4={p['g4']:.4f} "
                     f"g6={p['g6']:.5f} μ={p['mu']:.4f} | "
                     f"Active quanta: {n_active}/{cfg['n_quanta']}"
                 )
@@ -362,7 +379,7 @@ def generate_text_verbose(model, tokenizer, device,
 
     print(f"\nGenerated:\n  {text}\n")
     print("=== Minkowski Field State ===")
-    print(f"  Action params:  m²={p['m2']:.4f}  g4={p['g4']:.4f}  "
+    print(f"  Action params:  m²={p['m2']:.4f}  g3={p['g3']:.4f}  g4={p['g4']:.4f}  "
           f"g6={p['g6']:.5f}  μ={p['mu']:.4f}")
     print(f"  ESS:            mean={stats['ess_mean']:.3f}  "
           f"min={stats['ess_min']:.3f}")

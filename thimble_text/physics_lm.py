@@ -171,10 +171,11 @@ class MinkowskiAction(nn.Module):
     def __init__(self):
         super().__init__()
         # log-parameterisation enforces positivity for m², g4, g6
-        self.log_m2  = nn.Parameter(torch.tensor(0.0))    # m²  ~ 1.0
-        self.log_g4  = nn.Parameter(torch.tensor(-1.5))   # g4  ~ 0.22
-        self.log_g6  = nn.Parameter(torch.tensor(-2.5))   # g6  ~ 0.08
-        self.mu      = nn.Parameter(torch.tensor(0.15))   # chemical potential
+        self.log_m2  = nn.Parameter(torch.tensor(0.0))    
+        self.g3      = nn.Parameter(torch.tensor(0.0))    
+        self.log_g4  = nn.Parameter(torch.tensor(-1.5))   
+        self.log_g6  = nn.Parameter(torch.tensor(-3.0))   
+        self.raw_mu  = nn.Parameter(torch.tensor(-2.0)) 
 
     # ------------------------------------------------------------------
     def forward(self, phi: torch.Tensor):
@@ -197,12 +198,14 @@ class MinkowskiAction(nn.Module):
         kinetic = 0.5 * (dphi ** 2).sum(dim=-1)                    # [B, T-1]
 
         m2  = torch.exp(self.log_m2)
+        g3  = self.g3 
         g4  = torch.exp(self.log_g4)
         g6  = torch.exp(self.log_g6)
-        mu  = self.mu
+        mu  = 0.28 * torch.sigmoid(self.raw_mu) 
 
         # Potential terms — note MINUS signs (Minkowski convention)
         mass  = -0.5        * m2 * (phi_n ** 2).sum(dim=-1)        # [B, T]
+        phi3 = -(self.g3 / 6.0) * (phi_n ** 3).sum(dim=-1)
         phi4  = -(g4/24.0)       * (phi_n ** 4).sum(dim=-1)
         phi6  = -(g6/720.0)      * (phi_n ** 6).sum(dim=-1)
 
@@ -211,13 +214,13 @@ class MinkowskiAction(nn.Module):
         hop_bwd = (torch.roll(phi_n,  1, dims=1) * phi_n).sum(dim=-1)
         chem    = -0.5 * (torch.exp(mu) * hop_fwd + torch.exp(-mu) * hop_bwd)
 
-        S_density              = mass + phi4 + phi6 + chem         # [B, T]
+        S_density              = mass + phi3+phi4 + phi6 + chem         # [B, T]
         S_density[:, :-1]     += kinetic                           # add kinetic
 
         S_M_scalar = S_density.sum(dim=-1)                         # [B]
 
         params = {
-            'm2': m2.item(), 'g4': g4.item(),
+            'm2': m2.item(), 'g3': self.g3.item(),'g4': g4.item(),
             'g6': g6.item(), 'mu': mu.item(),
         }
         return S_M_scalar, S_density, params
@@ -284,7 +287,7 @@ class ThimbleImportanceSampler(nn.Module):
         return LagrangianParams(
             m2            = float(np.clip(action_params['m2'],   0.3, 1.7)),
             kinetic_coeff = 1.0,
-            g3            = 0.0,
+            g3            = float(np.clip(action_params.get('g3', 0.0), -2.0, 2.0)),
             g4            = float(np.clip(action_params['g4'],   0.0, 0.7)),
             g6            = float(np.clip(action_params['g6'],   0.0, 0.3)),
             box_coeff     = 0.0,
@@ -293,53 +296,69 @@ class ThimbleImportanceSampler(nn.Module):
         )
 
     # ------------------------------------------------------------------
-    def forward(self, phi_in: torch.Tensor,
-            action_params: dict,
-            per_sample_params: list = None) -> tuple:
-        """
-        per_sample_params: list of B dicts, one per batch element.
-        If None, uses action_params for all samples (old behaviour).
-        """
+    def forward(self, phi_in: torch.Tensor, action_params: dict) -> tuple:
         B, T, D = phi_in.shape
-
-        phi_props = []
-        ess_list  = []
-
-        for b in range(B):
-            p_dict = per_sample_params[b] if per_sample_params else action_params
-            lp     = self._make_lagrangian_params(p_dict)
-
-            with torch.no_grad():
-                # More samples per sequence = better ESS
-                z = torch.randn(64, self.L, self.L, self.L, self.L,
-                                device=self.device)
-
-                phi_thimble, log_det = self.thimble(z, lp)
-                S_euc = self._euclidean_action.compute(phi_thimble, lp)
-
-                log_w = -S_euc.real + log_det         # [64]
-                ess   = effective_sample_size(log_w)
-                ess_list.append(ess)
-
-                w = torch.softmax(log_w - log_w.max(), dim=0)  # [64]
-
-                L = self.L
-                phi_re   = phi_thimble.real            # [64, L,L,L,L]
-                phi_flat = phi_re.reshape(64, L*L*L*L) # [64, L^4]
-
-                if L*L*L*L >= T:
-                    phi_seq = phi_flat[:, :T]
-                else:
-                    reps    = (T // (L*L*L*L)) + 1
-                    phi_seq = phi_flat.repeat(1, reps)[:, :T]
-
-                phi_mean = (phi_seq * w.unsqueeze(-1)).sum(dim=0)  # [T]
-                phi_props.append(phi_mean)
-
-        phi_mean_batch = torch.stack(phi_props, dim=0).unsqueeze(-1)  # [B, T, 1]
-        phi_prop       = phi_in + phi_mean_batch * phi_in
-        mean_ess       = float(np.mean(ess_list))
-
+        N_MC = self.n_mc
+        
+        # 1. Prepare Inputs for all B * N_MC samples at once
+        # Create params for the whole batch
+        lp = self._make_lagrangian_params(action_params)
+        
+        # We need to expand params if the thimble network expects per-item conditioning
+        # But your current thimble takes a single 'lp' object. 
+        # If your Thimble supports batched 'z' with shared 'lp', this is easy.
+        
+        # Generate noise for everything at once: [B * N_MC, L, L, L, L]
+        z = torch.randn(B * N_MC, self.L, self.L, self.L, self.L, device=self.device)
+        
+        # 2. Run Thimble ONCE (Vectorized)
+        # Note: Your Thimble model must support batch dimension > 1
+        phi_thimble, log_det = self.thimble(z, lp) 
+        # phi_thimble: [B*N_MC, L, L, L, L]
+        # log_det:     [B*N_MC]
+        
+        # 3. Compute Euclidean Action (Vectorized)
+        S_euc = self._euclidean_action.compute(phi_thimble, lp) # [B*N_MC]
+        
+        # 4. Reshape to separate Batch and MC dimensions
+        # [B, N_MC]
+        log_w_flat = -S_euc.real + log_det
+        log_w = log_w_flat.view(B, N_MC)
+        
+        # 5. Calculate Weights and ESS per batch item
+        # Max over MC dim for numerical stability
+        max_log_w = torch.max(log_w, dim=1, keepdim=True)[0]
+        w = torch.exp(log_w - max_log_w)
+        w = w / (torch.sum(w, dim=1, keepdim=True) + 1e-10) # Normalize [B, N_MC]
+        
+        # Calculate ESS per batch item
+        # ESS = (sum w)^2 / sum w^2. Since w is normalized, sum w = 1.
+        # So ESS = 1 / sum(w^2)
+        ess_vals = 1.0 / (torch.sum(w**2, dim=1) * N_MC)
+        mean_ess = ess_vals.mean().item()
+        
+        # 6. Map Lattice Field to Sequence
+        # phi_thimble: [B*N_MC, L^4]
+        L = self.L
+        phi_flat = phi_thimble.real.reshape(B * N_MC, L*L*L*L)
+        
+        # Handle Sequence Length T mapping
+        if L*L*L*L >= T:
+            phi_seq = phi_flat[:, :T]
+        else:
+            reps = (T // (L*L*L*L)) + 1
+            phi_seq = phi_flat.repeat(1, reps)[:, :T]
+            
+        # Reshape to [B, N_MC, T]
+        phi_seq = phi_seq.view(B, N_MC, T)
+        
+        # 7. Importance Weighted Average
+        # w is [B, N_MC]. Expand to [B, N_MC, 1] for broadcast
+        phi_mean = torch.sum(phi_seq * w.unsqueeze(-1), dim=1) # [B, T]
+        
+        # 8. Apply to input
+        phi_prop = phi_in + phi_mean.unsqueeze(-1) * phi_in
+        
         return phi_prop, mean_ess, None
 
 
@@ -378,7 +397,7 @@ class MinkowskiFieldLM(nn.Module):
         self.action = MinkowskiAction()
 
         self.sampler = ThimbleImportanceSampler(
-            thimble_model_path, thimble_config, n_mc=16)
+            thimble_model_path, thimble_config, n_mc=48)
 
         # Action -> additive bias on field (modulates, doesn't suppress)
         self.action_proj = nn.Sequential(
@@ -440,10 +459,12 @@ class MinkowskiFieldLM(nn.Module):
         g4_target  = torch.tensor(0.3,  device=phi_in.device)
         mu_target  = torch.tensor(0.15, device=phi_in.device)
 
+        mu=0.28 * torch.sigmoid(self.action.raw_mu) 
         param_reg = (
             (torch.exp(self.action.log_m2) - m2_target)**2 +
             (torch.exp(self.action.log_g4) - g4_target)**2 +
-            (self.action.mu                - mu_target)**2
+            (mu                - mu_target)**2 +
+            (self.action.g3)**2 * 0.1 
         ) * 0.01
         # Normalise action density for use as field modulation
         S_norm = (S_density - S_density.mean(dim=-1, keepdim=True)) \
@@ -460,6 +481,9 @@ class MinkowskiFieldLM(nn.Module):
         phi_prop, ess, log_weights = self.sampler(
             phi_biased, action_params)                             # [B, T, D]
 
+        if ess < 0.05 and self.training:
+            phi_prop = phi_biased + (phi_prop - phi_biased).detach()
+
         # ── Step 4: causal propagation ───────────────────────────────
         mask     = self._causal(phi_prop.shape[1], token_ids.device)
         phi_out  = self.propagator(phi_prop, mask=mask)            # [B, T, D]
@@ -475,6 +499,7 @@ class MinkowskiFieldLM(nn.Module):
         return {
             'm2': torch.exp(self.action.log_m2).item(),
             'g4': torch.exp(self.action.log_g4).item(),
+            'g3': self.action.g3.item(),
             'g6': torch.exp(self.action.log_g6).item(),
-            'mu': self.action.mu.item(),
+            'mu': (0.28 * torch.sigmoid(self.action.raw_mu) ).item(),
         }
