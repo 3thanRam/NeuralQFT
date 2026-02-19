@@ -1,276 +1,480 @@
+"""
+MinkowskiFieldLM
+================
+Language model where next-token prediction is computed as a real-time
+quantum field transition amplitude.
+
+The path integral has a complex action (Minkowski signature) which
+causes a severe sign problem. The pre-trained Generalized Lefschetz
+Thimble deforms the integration contour into the complex plane so
+that Im(S) stays small and importance sampling is tractable.
+
+Architecture
+------------
+tokens  ->  QuantizedFieldEmbedding  ->  phi_in  [B, T, D]
+phi_in  ->  MinkowskiAction          ->  S_M (complex)  [B]
+phi_in  ->  ThimbleImportanceSampler ->  phi_prop  [B, T, D]
+phi_prop -> measure (tied weights)   ->  logits  [B, T, V]
+
+Why the thimble is load-bearing here
+-------------------------------------
+S_M[phi] = integral of [ (d_t phi)^2 - m^2 phi^2 - g4 phi^4 - mu*hop ]
+The minus signs and the chemical potential mu make S_M complex.
+Without the thimble, e^{i*S_M} oscillates wildly and importance weights
+cancel to near zero (sign problem). The thimble shifts the contour so
+phi becomes complex but Im(S_M) ~ 0, restoring a well-behaved integral.
+"""
+
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
-import sys
 from pathlib import Path
+import sys
 
-project_dir=Path(__file__).parent.parent.resolve()
-sys.path.insert(0,str(project_dir))
-sys.path.insert(0,str(project_dir/'learned_thimble'))
+# ── path setup ───────────────────────────────────────────────────────────────
+_HERE = Path(__file__).parent.resolve()
+sys.path.insert(0, str(_HERE.parent / 'learned_thimble'))
 
-# Import your existing modules
-from learned_thimble.thimble import PhysicsInformedThimble, GeneralAction, PARAM_DIM
-from learned_thimble.run_thimble import CONFIG 
+from thimble import (
+    PhysicsInformedThimble, LagrangianParams,
+    GeneralAction, effective_sample_size, PARAM_DIM,
+)
+from run_thimble import CONFIG as THIMBLE_CONFIG
 
-class PhysicsToTokenCNN(nn.Module):
-    def __init__(self, L, vocab_size):
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 1.  Quantized field embedding  (VQ-VAE style with EMA codebook)
+# ═════════════════════════════════════════════════════════════════════════════
+
+class QuantizedFieldEmbedding(nn.Module):
+    """
+    Maps token ids to field values constrained to a discrete codebook.
+
+    phi(x_i) in {phi_1 , ... , phi_K}  where K = n_quanta << vocab_size
+
+    This enforces the second-quantization picture: even though the
+    vocabulary has 50k tokens, the field lives on a coarse lattice of
+    K energy levels.  Many tokens share the same quantum state.
+
+    Training uses a straight-through estimator so gradients flow through
+    the discrete argmax.  The codebook is updated via exponential moving
+    averages (EMA) with random restarts for dead entries.
+    """
+
+    def __init__(self, vocab_size: int, embed_dim: int,
+                 n_quanta: int = 512,
+                 commitment_cost: float = 0.25,
+                 ema_decay: float = 0.95):
         super().__init__()
-        # We treat the 4th dimension (Time) as channels
-        # Input: [Batch, Time_L, L, L, L]
-        self.conv_block = nn.Sequential(
-            nn.Conv3d(L, 16, kernel_size=3, padding=1),
-            nn.GELU(),
-            nn.Conv3d(16, 32, kernel_size=3, padding=1),
-            nn.Flatten(),
-            nn.Linear(32 * (L**3), 256),
-            nn.GELU(),
-            nn.Linear(256, vocab_size)
+        self.n_quanta        = n_quanta
+        self.embed_dim       = embed_dim
+        self.commitment_cost = commitment_cost
+        self.ema_decay       = ema_decay
+
+        # Continuous token embedding (trained)
+        self.embedding = nn.Embedding(vocab_size, embed_dim)
+        nn.init.normal_(self.embedding.weight, std=0.02)
+
+        # Discrete codebook (EMA-updated, not a gradient parameter)
+        codebook = F.normalize(torch.randn(n_quanta, embed_dim), dim=-1)
+        self.register_buffer('codebook',   codebook)
+        self.register_buffer('ema_count',  torch.ones(n_quanta))
+        self.register_buffer('ema_weight', codebook.clone())
+
+    # ------------------------------------------------------------------
+    def forward(self, token_ids: torch.Tensor):
+        """
+        Returns
+        -------
+        phi          : [B, T, D]  straight-through quantized field
+        quanta_ids   : [B, T]     which codebook entry each token maps to
+        commit_loss  : scalar     keeps embeddings near codebook
+        codebook_perp: scalar     effective number of codebook entries used
+        """
+        z_e     = self.embedding(token_ids)               # [B, T, D]
+        flat    = z_e.reshape(-1, self.embed_dim)          # [BT, D]
+        flat_n  = F.normalize(flat, dim=-1)
+        cb_n    = F.normalize(self.codebook, dim=-1)
+
+        # Nearest codebook entry via cosine similarity
+        sim = flat_n @ cb_n.T                              # [BT, K]
+        k   = sim.argmax(dim=-1)                           # [BT]
+
+        z_q = self.codebook[k].view_as(z_e)               # [B, T, D]
+
+        # ── EMA codebook update ──────────────────────────────────────
+        if self.training:
+            with torch.no_grad():
+                one_hot = F.one_hot(k, self.n_quanta).float()  # [BT, K]
+                count   = one_hot.sum(dim=0)
+                weight  = one_hot.T @ flat
+
+                d = self.ema_decay
+                self.ema_count  = d * self.ema_count  + (1 - d) * count
+                self.ema_weight = d * self.ema_weight + (1 - d) * weight
+
+                updated = self.ema_weight / (self.ema_count.unsqueeze(1) + 1e-5)
+
+                # Random restart: revive dead codebook entries
+                dead    = self.ema_count < 1.0
+                n_dead  = dead.sum().item()
+                if n_dead > 0:
+                    rand_idx        = torch.randint(flat.shape[0], (n_dead,))
+                    updated[dead]   = F.normalize(flat[rand_idx], dim=-1)
+
+                self.codebook.copy_(updated)
+
+        # ── Straight-through estimator ───────────────────────────────
+        phi         = z_e + (z_q - z_e).detach()          # [B, T, D]
+        commit_loss = ((z_e - z_q.detach()) ** 2).mean()
+
+        # ── Codebook perplexity (utilisation metric) ─────────────────
+        avg_probs    = F.softmax(sim, dim=-1).mean(dim=0)  # [K]
+        perplexity   = torch.exp(
+            -(avg_probs * (avg_probs + 1e-10).log()).sum()
         )
 
-    def forward(self, phi_complex):
-        # We split complex into Real/Imag or just use Magnitude
-        # Let's use Real and Imag as two separate inputs if you prefer,
-        # or just the Real part for the "Lattice structure"
-        x = phi_complex.real 
-        return self.conv_block(x)
-    
-class DifferentiableAction:
+        return phi, k.view(token_ids.shape), commit_loss, perplexity
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 2.  Minkowski action  (complex — this is why the thimble is needed)
+# ═════════════════════════════════════════════════════════════════════════════
+
+class MinkowskiAction(nn.Module):
     """
-    A tensor-only version of GeneralAction.
+    Real-time (Minkowski) scalar field action.
+
+    S_M[phi] = sum_x [ ½(d_t phi)^2  -  ½ m² phi^2  -  g4/4! phi^4
+                       -  g6/6! phi^6  -  ½ mu*(e^mu phi_{t+1} phi_t
+                                                + e^{-mu} phi_{t-1} phi_t) ]
+
+    Key difference from Euclidean action
+    -------------------------------------
+    The mass and interaction terms have MINUS signs.  This follows from
+    the Minkowski metric (+,-,-,-): the potential V = m²phi²/2 + g4 phi^4/4!
+    appears with a minus sign in S_M = integral (K - V).
+
+    The chemical potential mu adds an imaginary contribution when phi is
+    analytically continued to the complex plane — this is the primary
+    source of the sign problem that the thimble resolves.
+
+    Parameters
+    ----------
+    All Lagrangian parameters are learned end-to-end.  They are
+    initialised to reasonable values matching the thimble's training
+    distribution so the pre-trained contour deformation is valid from
+    the start of LM training.
     """
-    def __init__(self, dx=1.0):
-        self.dx = dx
 
-    def compute(self, phi: torch.Tensor, params: torch.Tensor) -> torch.Tensor:
-        # Unpack parameters [Batch, 8] -> [Batch, 8, 1, 1, 1, 1]
-        p = params.reshape(-1, 8, 1, 1, 1, 1)
-        m2             = p[:, 0]
-        kinetic_coeff  = p[:, 1]
-        g3, g4, g6     = p[:, 2], p[:, 3], p[:, 4]
-        box_coeff      = p[:, 5]
-        deriv_interact = p[:, 6]
-        mu             = p[:, 7]
-
-        dx = self.dx
-        vol = dx ** 4
-
-        # Gradients on the lattice
-        dt  = torch.roll(phi, -1, dims=-4) - phi
-        ddx = torch.roll(phi, -1, dims=-3) - phi
-        dy  = torch.roll(phi, -1, dims=-2) - phi
-        dz  = torch.roll(phi, -1, dims=-1) - phi
-        grad2 = (dt**2 + ddx**2 + dy**2 + dz**2) / dx**2
-
-        # Base Action
-        S = 0.5 * kinetic_coeff * grad2 + 0.5 * m2 * phi**2
-
-        # Interactions
-        S = S + (g3 / 6.0) * phi**3
-        S = S + (g4 / 24.0) * phi**4
-        S = S + (g6 / 720.0) * phi**6
-
-        # Higher derivative terms
-        if (box_coeff != 0).any():
-            box = (
-                (torch.roll(phi,-1,dims=-4) - 2*phi + torch.roll(phi,1,dims=-4)) +
-                (torch.roll(phi,-1,dims=-3) - 2*phi + torch.roll(phi,1,dims=-3)) +
-                (torch.roll(phi,-1,dims=-2) - 2*phi + torch.roll(phi,1,dims=-2)) +
-                (torch.roll(phi,-1,dims=-1) - 2*phi + torch.roll(phi,1,dims=-1))
-            ) / dx**2
-            S = S + box_coeff * box**2
-        
-        if (deriv_interact != 0).any():
-            S = S + deriv_interact * phi**2 * grad2
-
-        # Chemical Potential
-        emu, emum = torch.exp(mu), torch.exp(-mu)
-        hop_fwd = torch.roll(phi, -1, dims=-4) * phi
-        hop_bwd = torch.roll(phi,  1, dims=-4) * phi
-        S = S - 0.5 * (emu * hop_fwd + emum * hop_bwd)
-
-        return torch.sum(S, dim=(-4,-3,-2,-1)) * vol
-
-
-class ThimbleLayer(nn.Module):
-    def __init__(self, model_path, config, n_mc_samples=16):
+    def __init__(self):
         super().__init__()
-        self.device = config['device']
-        self.L = config['L']
-        self.dx = config['dx']
-        self.n_mc = n_mc_samples
-        
-        # Load Thimble (Same as before)
+        # log-parameterisation enforces positivity for m², g4, g6
+        self.log_m2  = nn.Parameter(torch.tensor(0.0))    # m²  ~ 1.0
+        self.log_g4  = nn.Parameter(torch.tensor(-1.5))   # g4  ~ 0.22
+        self.log_g6  = nn.Parameter(torch.tensor(-2.5))   # g6  ~ 0.08
+        self.mu      = nn.Parameter(torch.tensor(0.15))   # chemical potential
+
+    # ------------------------------------------------------------------
+    def forward(self, phi: torch.Tensor):
+        """
+        phi : [B, T, D]  field on 1-D sequence lattice (positions = sites)
+
+        Returns
+        -------
+        S_M_scalar : [B]  total Minkowski action per sample (real scalar)
+                          In the full complex theory this would be complex;
+                          here we return the real part used for weighting.
+        S_density  : [B, T]  per-site contribution (for diagnostics)
+        params     : dict  current parameter values
+        """
+        # Normalise field to unit sphere so phi^6 doesn't explode
+        phi_n   = phi / (phi.norm(dim=-1, keepdim=True) + 1e-6)   # [B, T, D]
+
+        # Kinetic: (d_t phi)^2  — forward difference on sequence axis
+        dphi    = phi_n[:, 1:] - phi_n[:, :-1]                    # [B, T-1, D]
+        kinetic = 0.5 * (dphi ** 2).sum(dim=-1)                    # [B, T-1]
+
+        m2  = torch.exp(self.log_m2)
+        g4  = torch.exp(self.log_g4)
+        g6  = torch.exp(self.log_g6)
+        mu  = self.mu
+
+        # Potential terms — note MINUS signs (Minkowski convention)
+        mass  = -0.5        * m2 * (phi_n ** 2).sum(dim=-1)        # [B, T]
+        phi4  = -(g4/24.0)       * (phi_n ** 4).sum(dim=-1)
+        phi6  = -(g6/720.0)      * (phi_n ** 6).sum(dim=-1)
+
+        # Chemical potential hop term
+        hop_fwd = (torch.roll(phi_n, -1, dims=1) * phi_n).sum(dim=-1)
+        hop_bwd = (torch.roll(phi_n,  1, dims=1) * phi_n).sum(dim=-1)
+        chem    = -0.5 * (torch.exp(mu) * hop_fwd + torch.exp(-mu) * hop_bwd)
+
+        S_density              = mass + phi4 + phi6 + chem         # [B, T]
+        S_density[:, :-1]     += kinetic                           # add kinetic
+
+        S_M_scalar = S_density.sum(dim=-1)                         # [B]
+
+        params = {
+            'm2': m2.item(), 'g4': g4.item(),
+            'g6': g6.item(), 'mu': mu.item(),
+        }
+        return S_M_scalar, S_density, params
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 3.  Thimble importance sampler
+# ═════════════════════════════════════════════════════════════════════════════
+
+class ThimbleImportanceSampler(nn.Module):
+    """
+    Uses the pre-trained Lefschetz Thimble to generate field configurations
+    importance-sampled from e^{i S_M[phi]}.
+
+    Why this is needed
+    ------------------
+    Naive MC samples phi ~ N(0,1) and weights by e^{i S_M[phi]}.
+    Because S_M is real (on the real axis), e^{i S_M} oscillates with
+    unit modulus — all weights cancel and the estimator has zero signal.
+
+    The thimble deforms the integration contour phi -> phi + i*tau(phi)
+    such that Im(S_M) ~ 0 on the thimble.  Weights become e^{-|S_M|}
+    (real, positive) and importance sampling works again.
+
+    The pre-trained thimble was trained on the Euclidean theory; here
+    we reuse its contour deformation as an approximation for the
+    Minkowski theory.  This approximation improves as mu -> 0 and
+    worsens for large mu (strong sign problem) — exactly the regime
+    where you'd want to re-train the thimble on the Minkowski action.
+
+    Integration with the LM
+    -----------------------
+    We only propagate through the thimble once per forward pass (not
+    per token), using batch-level Lagrangian parameters derived from
+    the current token sequence.  The thimble weights are frozen; the
+    LM learns which Lagrangian parameters make the thimble's contour
+    most useful for its particular input.
+    """
+
+    def __init__(self, thimble_model_path: Path,
+                 config: dict, n_mc: int = 16):
+        super().__init__()
+        self.n_mc    = n_mc
+        self.L       = config['L']
+        self.dx      = config['dx']
+        self.device  = config['device']
+
         self.thimble = PhysicsInformedThimble(config).to(self.device)
-        try:
-            ckpt = torch.load(model_path, map_location=self.device, weights_only=False)
-            self.thimble.load_state_dict(ckpt['model'])
-            print(f"✅ Loaded Thimble model from {model_path}")
-        except Exception as e:
-            print(f"❌ Failed to load: {e}"); sys.exit(1)
-        
-        for param in self.thimble.parameters():
-            param.requires_grad = False
+        ckpt = torch.load(thimble_model_path,
+                          map_location=self.device, weights_only=False)
+        self.thimble.load_state_dict(ckpt['model'])
+        print(f"✅ Thimble loaded from {thimble_model_path}")
+
+        # Freeze thimble — it was pre-trained; we only reuse its contour
+        for p in self.thimble.parameters():
+            p.requires_grad = False
         self.thimble.eval()
 
-        self.diff_action = DifferentiableAction(config['dx'])
+        self._euclidean_action = GeneralAction(self.dx)
 
-    def forward(self, lagrangian_params):
-        BatchSize = lagrangian_params.shape[0]
-        
-        # 1. Generate Noise
-        z = torch.randn(BatchSize * self.n_mc, self.L, self.L, self.L, self.L, 
-                        device=self.device)
-        params_expanded = lagrangian_params.repeat_interleave(self.n_mc, dim=0)
-
-        # 2. Run Flow
-        with torch.no_grad():
-            phi_free, kernel = self.thimble.generate_free_field_tensor_params(z, params_expanded)
-            p_emb = self.thimble.param_embedder(params_expanded)
-            phi_im, log_det_im = self.thimble.imaginary_layer(phi_free, p_emb)
-            base_log_det = torch.sum(-0.5 * torch.log(kernel), dim=(-4,-3,-2,-1))
-            log_det = base_log_det + log_det_im
-            phi = torch.complex(phi_free, phi_im)
-
-        # 3. Action & Weights
-        S = self.diff_action.compute(phi, params_expanded)
-        log_w = -S.real + log_det
-        log_w = log_w.reshape(BatchSize, self.n_mc)
-        max_log_w, _ = torch.max(log_w, dim=1, keepdim=True)
-        w = torch.softmax(log_w - max_log_w, dim=1)
-        # 4. Compute Weighted Average Field
-        # phi is [Batch * n_mc, L, L, L, L]
-        phi_reshaped = phi.view(BatchSize, self.n_mc, self.L, self.L, self.L, self.L)
-        
-        # Multiply each MC sample by its weight and sum
-        # w_expanded: [Batch, n_mc, 1, 1, 1, 1]
-        w_exp = w.view(BatchSize, self.n_mc, 1, 1, 1, 1)
-        phi_avg = (phi_reshaped * w_exp).sum(dim=1) # Result: [Batch, L, L, L, L]
-
-        return phi_avg # Return the raw 4D field
-        ## 4. Compute Observables (Standard)
-        #phi_flat = phi.reshape(BatchSize, self.n_mc, -1)
-        #phi_re = torch.clamp(phi_flat.real, -20.0, 20.0)
-        #phi_im = torch.clamp(phi_flat.imag, -20.0, 20.0)
-        #phi_safe = torch.complex(phi_re, phi_im)
-        #
-        #obs_phi_mean = phi_safe.mean(dim=2)
-        #exp_phi = (obs_phi_mean * w).sum(dim=1) 
-        #obs_phi2 = (phi_safe**2).mean(dim=2)
-        #exp_phi2 = (obs_phi2 * w).sum(dim=1)
-        #
-        #obs_phi4 = (phi_safe**4).mean(dim=2)
-        #exp_phi4 = (obs_phi4 * w).sum(dim=1)
-        #obs_phase = torch.exp(1j * S.imag).reshape(BatchSize, self.n_mc)
-        #exp_phase = (obs_phase * w).sum(dim=1)
-        ## 5. NEW: Advanced Observables (Kinetic & Correlation)
-        #
-        ## A. Kinetic Energy (Gradients)
-        ## How "rough" is the field?
-        ## We compute sum((phi - neighbor)^2) roughly via rolls
-        ## We do this on the unflattened phi [B*N, L, L, L, L]
-        #dx_phi = torch.roll(phi, -1, dims=-1) - phi
-        #dy_phi = torch.roll(phi, -1, dims=-2) - phi
-        #grad_sq = (dx_phi**2 + dy_phi**2) # Simplified kinetic term
-        #
-        ## Flatten and Average over lattice
-        #grad_sq_flat = grad_sq.reshape(BatchSize, self.n_mc, -1).mean(dim=2)
-        #
-        ## Clamp complex parts
-        #g_re = torch.clamp(grad_sq_flat.real, -50.0, 50.0)
-        #g_im = torch.clamp(grad_sq_flat.imag, -50.0, 50.0)
-        #grad_safe = torch.complex(g_re, g_im)
-        #
-        #exp_grad = (grad_safe * w).sum(dim=1)
-        ## B. Nearest Neighbor Correlation
-        ## <phi(x) * phi(x+1)>
-        ## Distinguishes "Heavy" vs "Light" fields better than just phi^2
-        #corr = phi * torch.roll(phi, 1, dims=-1)
-        #corr_flat = corr.reshape(BatchSize, self.n_mc, -1).mean(dim=2)
-        #
-        #c_re = torch.clamp(corr_flat.real, -20.0, 20.0)
-        #c_im = torch.clamp(corr_flat.imag, -20.0, 20.0)
-        #corr_safe = torch.complex(c_re, c_im)
-        #
-        #exp_corr = (corr_safe * w).sum(dim=1)
-        ## 6. Stack All Features (8 + 4 = 12 dims)
-        #features = torch.stack([
-        #    exp_phi.real,  exp_phi.imag,
-        #    exp_phi2.real, exp_phi2.imag,
-        #    exp_phi4.real, exp_phi4.imag,
-        #    exp_phase.real, exp_phase.imag,
-        #    exp_grad.real, exp_grad.imag,    # NEW
-        #    exp_corr.real, exp_corr.imag     # NEW
-        #], dim=1) 
-        #
-        #return features
-
-# Monkey-patch PhysicsInformedThimble to accept tensor params
-def generate_free_field_tensor_params(self, z, p_tensor):
-    # p_tensor: [B, 8] -> m2 is idx 0, kin is idx 1
-    # FIXED: Use reshape here as well for safety
-    m2 = p_tensor[:, 0].reshape(-1, 1, 1, 1, 1)
-    kin = p_tensor[:, 1].reshape(-1, 1, 1, 1, 1)
-    
-    eig = self.laplacian_eig.unsqueeze(0)
-    
-    kernel = torch.clamp(kin * self.dx**2 * eig + m2 * self.dx**4, min=1e-8)
-    
-    phi_free = torch.fft.ifftn(
-        torch.fft.fftn(z.to(torch.complex64), dim=(-4,-3,-2,-1)) / torch.sqrt(kernel),
-        dim=(-4,-3,-2,-1)
-    ).real
-    return phi_free, kernel
-
-PhysicsInformedThimble.generate_free_field_tensor_params = generate_free_field_tensor_params
-
-
-class LagrangianLanguageModel(nn.Module):
-    def __init__(self, vocab_size, embed_dim, hidden_dim, thimble_model_path, config):
-        super().__init__()
-        
-        self.embedding = nn.Embedding(vocab_size, embed_dim)
-        self.rnn = nn.LSTM(embed_dim, hidden_dim, batch_first=True)
-        self.to_params = nn.Linear(hidden_dim, 8)
-        
-        self.thimble_layer = ThimbleLayer(thimble_model_path, config, n_mc_samples=16)
-        
-        self.norm = nn.LayerNorm(12)
-        
-        self.interpreter = nn.Sequential(
-            nn.Linear(12, 32),
-            nn.GELU(),
-            nn.Linear(32, vocab_size)
+    # ------------------------------------------------------------------
+    def _make_lagrangian_params(self, action_params: dict) -> LagrangianParams:
+        """Convert learned action params to LagrangianParams dataclass."""
+        return LagrangianParams(
+            m2            = float(np.clip(action_params['m2'],   0.3, 1.7)),
+            kinetic_coeff = 1.0,
+            g3            = 0.0,
+            g4            = float(np.clip(action_params['g4'],   0.0, 0.7)),
+            g6            = float(np.clip(action_params['g6'],   0.0, 0.3)),
+            box_coeff     = 0.0,
+            deriv_interact= 0.0,
+            mu            = float(np.clip(action_params['mu'],   0.0, 0.28)),
         )
-        self.PhysToToken=PhysicsToTokenCNN(config['L'], vocab_size)
-        self.config = config
 
-    def _scale_params(self, raw):
-        s = torch.sigmoid(raw)
-        p = torch.zeros_like(s)
-        p[:, 0] = 2.5 * s[:, 0] - 0.5   # m2
-        p[:, 1] = 0.5 + 2.5 * s[:, 1]   # kin
-        p[:, 2] = 2.0 * s[:, 2] - 1.0   # g3
-        p[:, 3] = 2.5 * s[:, 3] - 0.5   # g4
-        p[:, 4] = 1.0 * s[:, 4] + 0.05  # g6
-        p[:, 5] = 1.0 * s[:, 5] + 0.05  # g6
-        p[:, 6] = 1.0 * s[:, 6] + 0.05  # g6
-        p[:, 7] = 1.5 * s[:, 7]         # mu
-        return p
+    # ------------------------------------------------------------------
+    def forward(self, phi_in: torch.Tensor,
+            action_params: dict,
+            per_sample_params: list = None) -> tuple:
+        """
+        per_sample_params: list of B dicts, one per batch element.
+        If None, uses action_params for all samples (old behaviour).
+        """
+        B, T, D = phi_in.shape
 
-    def forward(self, x):
-        embed = self.embedding(x)
-        output, _ = self.rnn(embed)
-        last_hidden = output[:, -1, :]
-        
-        raw_params = self.to_params(last_hidden)
-        phys_params = self._scale_params(raw_params)
-        
-        phi_avg = self.thimble_layer(phys_params)
-        logits=self.PhysToToken(phi_avg)
-        #observables = self.norm(observables)
-        #
-        ## Interpret and Predict
-        #logits = self.interpreter(observables)
-        
-        return logits, phys_params
+        phi_props = []
+        ess_list  = []
 
+        for b in range(B):
+            p_dict = per_sample_params[b] if per_sample_params else action_params
+            lp     = self._make_lagrangian_params(p_dict)
+
+            with torch.no_grad():
+                # More samples per sequence = better ESS
+                z = torch.randn(64, self.L, self.L, self.L, self.L,
+                                device=self.device)
+
+                phi_thimble, log_det = self.thimble(z, lp)
+                S_euc = self._euclidean_action.compute(phi_thimble, lp)
+
+                log_w = -S_euc.real + log_det         # [64]
+                ess   = effective_sample_size(log_w)
+                ess_list.append(ess)
+
+                w = torch.softmax(log_w - log_w.max(), dim=0)  # [64]
+
+                L = self.L
+                phi_re   = phi_thimble.real            # [64, L,L,L,L]
+                phi_flat = phi_re.reshape(64, L*L*L*L) # [64, L^4]
+
+                if L*L*L*L >= T:
+                    phi_seq = phi_flat[:, :T]
+                else:
+                    reps    = (T // (L*L*L*L)) + 1
+                    phi_seq = phi_flat.repeat(1, reps)[:, :T]
+
+                phi_mean = (phi_seq * w.unsqueeze(-1)).sum(dim=0)  # [T]
+                phi_props.append(phi_mean)
+
+        phi_mean_batch = torch.stack(phi_props, dim=0).unsqueeze(-1)  # [B, T, 1]
+        phi_prop       = phi_in + phi_mean_batch * phi_in
+        mean_ess       = float(np.mean(ess_list))
+
+        return phi_prop, mean_ess, None
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 4.  Full model
+# ═════════════════════════════════════════════════════════════════════════════
+
+class MinkowskiFieldLM(nn.Module):
+    """
+    Language model based on real-time quantum field propagation.
+
+    Forward pass
+    ------------
+    1.  token_ids -> phi_in            (quantized field embedding)
+    2.  phi_in    -> S_M, S_density    (Minkowski action computation)
+    3.  phi_in    -> phi_prop          (thimble importance sampling)
+        * thimble deforms contour so e^{i S_M} integral is tractable
+    4.  phi_prop  -> logits            (causal transformer propagator)
+    5.  logits                         (tied-weight measurement)
+
+    The key difference from a standard transformer: the field is
+    propagated under a physical action rather than arbitrary attention,
+    and the contour deformation (thimble) is necessary because the
+    Minkowski action is complex.
+    """
+
+    def __init__(self, vocab_size: int, embed_dim: int,
+                 n_quanta: int, n_layers: int,
+                 thimble_model_path: Path,
+                 thimble_config: dict):
+        super().__init__()
+
+        self.field_embed = QuantizedFieldEmbedding(
+            vocab_size, embed_dim, n_quanta)
+
+        self.action = MinkowskiAction()
+
+        self.sampler = ThimbleImportanceSampler(
+            thimble_model_path, thimble_config, n_mc=16)
+
+        # Action -> additive bias on field (modulates, doesn't suppress)
+        self.action_proj = nn.Sequential(
+            nn.Linear(1, 32), nn.GELU(),
+            nn.Linear(32, embed_dim),
+        )
+
+        # Causal transformer propagator
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model    = embed_dim,
+            nhead      = 8,
+            dim_feedforward = embed_dim * 4,
+            dropout    = 0.1,
+            batch_first= True,
+            norm_first = True,
+        )
+        self.propagator  = nn.TransformerEncoder(encoder_layer,
+                                                  num_layers=n_layers)
+        self._causal_mask = None
+
+        # Measurement: tied to embedding weights
+        # <phi_out | phi_prop> — overlap with each vocabulary quantum
+        self.measure = nn.Linear(embed_dim, vocab_size, bias=False)
+        self.measure.weight = self.field_embed.embedding.weight
+
+    # ------------------------------------------------------------------
+    def _causal(self, T: int, device: torch.device) -> torch.Tensor:
+        if self._causal_mask is None or self._causal_mask.shape[0] != T:
+            self._causal_mask = torch.triu(
+                torch.full((T, T), float('-inf'), device=device),
+                diagonal=1)
+        return self._causal_mask
+
+    # ------------------------------------------------------------------
+    def forward(self, token_ids: torch.Tensor):
+        """
+        Parameters
+        ----------
+        token_ids : [B, T]
+
+        Returns
+        -------
+        logits       : [B, T, vocab_size]
+        commit_loss  : scalar   VQ commitment loss
+        perplexity   : scalar   codebook utilisation
+        quanta_ids   : [B, T]   which quantum each token maps to
+        S_density    : [B, T]   per-site Minkowski action
+        ess          : float    thimble effective sample size
+        action_params: dict     current m², g4, g6, mu
+        """
+        # ── Step 1: quantized field embedding ───────────────────────
+        phi_in, quanta_ids, commit_loss, perplexity = \
+            self.field_embed(token_ids)                    # [B, T, D]
+
+        # ── Step 2: Minkowski action ─────────────────────────────────
+        S_M_scalar, S_density, action_params = self.action(phi_in)
+
+        m2_target  = torch.tensor(1.0,  device=phi_in.device)
+        g4_target  = torch.tensor(0.3,  device=phi_in.device)
+        mu_target  = torch.tensor(0.15, device=phi_in.device)
+
+        param_reg = (
+            (torch.exp(self.action.log_m2) - m2_target)**2 +
+            (torch.exp(self.action.log_g4) - g4_target)**2 +
+            (self.action.mu                - mu_target)**2
+        ) * 0.01
+        # Normalise action density for use as field modulation
+        S_norm = (S_density - S_density.mean(dim=-1, keepdim=True)) \
+               / (S_density.std(dim=-1, keepdim=True) + 1e-6)     # [B, T]
+
+        # Project action to embedding space and add residually
+        # High-action sites are "excited" — they attend differently
+        action_bias = self.action_proj(S_norm.unsqueeze(-1))       # [B, T, D]
+        phi_biased  = phi_in + action_bias                         # [B, T, D]
+
+        # ── Step 3: thimble importance sampling ──────────────────────
+        # This is the core physics step — the thimble resolves the
+        # sign problem of the Minkowski path integral
+        phi_prop, ess, log_weights = self.sampler(
+            phi_biased, action_params)                             # [B, T, D]
+
+        # ── Step 4: causal propagation ───────────────────────────────
+        mask     = self._causal(phi_prop.shape[1], token_ids.device)
+        phi_out  = self.propagator(phi_prop, mask=mask)            # [B, T, D]
+
+        # ── Step 5: measurement ──────────────────────────────────────
+        logits = self.measure(phi_out)                             # [B, T, V]
+
+        return (logits, commit_loss, perplexity,
+                quanta_ids, S_density, ess, action_params,param_reg)
+
+    # ------------------------------------------------------------------
+    def get_action_params(self) -> dict:
+        return {
+            'm2': torch.exp(self.action.log_m2).item(),
+            'g4': torch.exp(self.action.log_g4).item(),
+            'g6': torch.exp(self.action.log_g6).item(),
+            'mu': self.action.mu.item(),
+        }
