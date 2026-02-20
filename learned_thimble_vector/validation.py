@@ -1,5 +1,15 @@
 """
 Validation
+
+Changes vs original:
+- Added _forward_batched() helper that runs model inference in small chunks.
+  This prevents OOM when n_samples is large (e.g. 2000) because the new
+  dual-path temporal conditioner has peak memory proportional to batch size.
+  Training uses batch=32 so it's fine; the original validation code used
+  single batches of 2000 which caused CUDA OOM on 8GB GPUs.
+- test_chemical_potential: replaced single randn(2000,...) with batched loop.
+- test_minkowski_sign_problem: same fix.
+- All other tests already used self.sample() which batches correctly.
 """
 
 import torch
@@ -52,6 +62,9 @@ class ValidationSuite:
         self.device = config['device']
         self.L      = config['L']
         self.dx     = config['dx']
+        # Safe batch size for validation forward passes.
+        # Kept small so the dual-path temporal conditioner doesn't OOM.
+        self.val_batch = config.get('val_batch_size', 50)
 
         self.model = PhysicsInformedThimble(config).to(self.device)
         try:
@@ -64,6 +77,44 @@ class ValidationSuite:
         self.model.eval()
         self.action = GeneralAction(self.dx)
         self.results = {}
+
+    # ── Memory-safe batched forward pass ──────────────────────────────────────
+
+    def _forward_batched(self, n: int, params: LagrangianParams):
+        """
+        Run n samples through the model in chunks of self.val_batch.
+
+        Returns
+        -------
+        phi     : [n, L, L, L, L] complex,  concatenated across batches
+        log_det : [n] real
+        S_E     : [n] complex  Euclidean action
+        S_M     : [n] complex  Minkowski action
+
+        All tensors are on CPU to avoid accumulating GPU memory.
+        """
+        all_phi, all_log_det, all_SE, all_SM = [], [], [], []
+        n_done = 0
+        with torch.no_grad():
+            while n_done < n:
+                bs = min(self.val_batch, n - n_done)
+                z  = torch.randn(bs, self.L, self.L, self.L, self.L,
+                                 device=self.device)
+                phi, log_det = self.model(z, params)
+                S_E = self.action.compute(phi, params)
+                S_M = self.action.minkowski_action(phi, params)
+                all_phi.append(phi.cpu())
+                all_log_det.append(log_det.cpu())
+                all_SE.append(S_E.cpu())
+                all_SM.append(S_M.cpu())
+                n_done += bs
+
+        return (torch.cat(all_phi,     dim=0),
+                torch.cat(all_log_det, dim=0),
+                torch.cat(all_SE,      dim=0),
+                torch.cat(all_SM,      dim=0))
+
+    # ── Importance-sampling estimator ─────────────────────────────────────────
 
     def sample(self, params: LagrangianParams,
                n_samples: int = 1000, batch_size: int = 50) -> dict:
@@ -126,7 +177,7 @@ class ValidationSuite:
     def test_propagator(self):
         print("\n=== Test 1: Free Field Propagator G(t) ===")
         p    = LagrangianParams(m2=1.0, kinetic_coeff=1.0)
-        obs  = self.sample(p, n_samples=10000, batch_size=100)
+        obs  = self.sample(p, n_samples=10000, batch_size=self.val_batch)
         G_th = obs['propagator']
         G_ex = AnalyticalSolutions.propagator_free(self.L, 1.0, dx=self.dx)
 
@@ -147,7 +198,7 @@ class ValidationSuite:
     def test_phi2_free(self):
         print("\n=== Test 2: <phi²> Free Theory ===")
         p   = LagrangianParams(m2=1.0, kinetic_coeff=1.0)
-        obs = self.sample(p, n_samples=5000, batch_size=100)
+        obs = self.sample(p, n_samples=5000, batch_size=self.val_batch)
         vt, et = obs['phi2'], obs['err_phi2']
         ve  = AnalyticalSolutions.phi2_free(self.L, 1.0, dx=self.dx)
         err = abs(vt - ve) / abs(ve)
@@ -160,7 +211,7 @@ class ValidationSuite:
         print("\n=== Test 3: <phi²> with phi^4 (g4=0.1) ===")
         g4  = 0.1
         p   = LagrangianParams(m2=1.0, kinetic_coeff=1.0, g4=g4)
-        obs = self.sample(p, n_samples=5000, batch_size=100)
+        obs = self.sample(p, n_samples=5000, batch_size=self.val_batch)
         vt, et = obs['phi2'], obs['err_phi2']
         ve  = AnalyticalSolutions.phi2_perturbative(self.L, 1.0, g4, dx=self.dx)
         err = abs(vt - ve) / abs(ve)
@@ -172,7 +223,7 @@ class ValidationSuite:
     def test_phi2_phi6(self):
         print("\n=== Test 4: <phi²> with phi^6 (g6=0.05) ===")
         p   = LagrangianParams(m2=1.0, kinetic_coeff=1.0, g6=0.05)
-        obs = self.sample(p, n_samples=3000, batch_size=100)
+        obs = self.sample(p, n_samples=3000, batch_size=self.val_batch)
         vt, et = obs['phi2'], obs['err_phi2']
         ve  = AnalyticalSolutions.phi2_free(self.L, 1.0, dx=self.dx)
         direction_ok = vt < ve
@@ -185,14 +236,13 @@ class ValidationSuite:
         print("\n=== Test 5: Chemical Potential μ=0.3 (Euclidean sign diagnostics) ===")
         mu = 0.3
         p  = LagrangianParams(m2=1.0, kinetic_coeff=1.0, mu=mu)
-        obs = self.sample(p, n_samples=3000, batch_size=100)
+        obs = self.sample(p, n_samples=3000, batch_size=self.val_batch)
 
-        with torch.no_grad():
-            z   = torch.randn(2000, self.L, self.L, self.L, self.L, device=self.device)
-            phi, _ = self.model(z, p)
-            S   = self.action.compute(phi, p)
-            avg_phase = torch.mean(torch.exp(1j * S.imag)).abs().item()
-            std_imS   = S.imag.std().item()
+        # Batched forward pass for sign diagnostics (avoids OOM)
+        n_diag = 2000
+        phi, _, S_E, _ = self._forward_batched(n_diag, p)
+        avg_phase = torch.mean(torch.exp(1j * S_E.imag)).abs().item()
+        std_imS   = S_E.imag.std().item()
 
         sign_problem  = avg_phase < 0.95
         thimble_helps = std_imS < 1.0
@@ -207,28 +257,13 @@ class ValidationSuite:
     def test_minkowski_sign_problem(self):
         """
         Test 7: Minkowski sign-problem suppression.
-
-        Directly measures what the unified Minkowski training phase was
-        optimising for: Var(Im S_M) on the deformed contour.
-
-        We test at three chemical potentials covering the range trained on
-        (mu=0 as a sanity baseline, mu=0.15 as mild, mu=0.28 as severe).
-        For each we report:
-
-          std(Im S_M)   — should be small if thimble solved sign problem.
-                          Baseline (undeformed real axis) grows rapidly with mu.
-          |<e^{i Im S_M}>|  — average Minkowski phase. Closer to 1 = better.
-          ESS           — importance-sampling efficiency on Minkowski weights.
-
-        A 'pass' threshold of std(Im S_M) < 1.5 is used; this is deliberately
-        lenient because the Minkowski phase only occupies the last 30% of
-        training.  Tighter thresholds (< 0.5) become achievable with more
-        epochs or a higher train_lambda_M.
+        Uses batched forward pass to avoid OOM on GPUs with limited VRAM.
         """
         print("\n=== Test 7: Minkowski Sign-Problem Suppression ===")
 
         mu_values   = [0.0, 0.15, 0.28]
-        std_thresh  = 1.5    # lenient pass threshold
+        std_thresh  = 1.5
+        n_diag      = 2000
 
         rows = []
         all_std_imSM = []
@@ -236,20 +271,13 @@ class ValidationSuite:
         for mu in mu_values:
             p = LagrangianParams(m2=1.0, kinetic_coeff=1.0, g4=0.1, mu=mu)
 
-            with torch.no_grad():
-                z   = torch.randn(2000, self.L, self.L, self.L, self.L,
-                                  device=self.device)
-                phi, log_det = self.model(z, p)
+            # Batched forward pass — safe for any GPU
+            phi, log_det, _, S_M = self._forward_batched(n_diag, p)
 
-                # Minkowski action on the deformed contour
-                S_M = self.action.minkowski_action(phi, p)
-
-                std_imSM  = S_M.imag.std().item()
-                avg_phase = torch.mean(torch.exp(1j * S_M.imag)).abs().item()
-
-                # Minkowski importance weights
-                log_w_M = -S_M.real + log_det
-                ess_M   = effective_sample_size(log_w_M)
+            std_imSM  = S_M.imag.std().item()
+            avg_phase = torch.mean(torch.exp(1j * S_M.imag)).abs().item()
+            log_w_M   = -S_M.real + log_det
+            ess_M     = effective_sample_size(log_w_M)
 
             passed = std_imSM < std_thresh
             status = "✅" if passed else "⚠️"
@@ -274,15 +302,14 @@ class ValidationSuite:
             'std_thresh':   std_thresh,
             'overall_pass': overall_pass,
             'all_std_imSM': all_std_imSM,
-            # ESS entry expected by plot_summary's ESS bar chart
-            'ess':          rows[-1]['ess_M'],       # report worst case (highest mu)
-            'n_eff':        max(1, int(rows[-1]['ess_M'] * 2000)),
+            'ess':          rows[-1]['ess_M'],
+            'n_eff':        max(1, int(rows[-1]['ess_M'] * n_diag)),
         }
 
     def test_consistency(self):
         print("\n=== Test 6: Consistency Checks (phi^4, g4=0.2) ===")
         p   = LagrangianParams(m2=1.0, kinetic_coeff=1.0, g4=0.2)
-        obs = self.sample(p, n_samples=3000, batch_size=100)
+        obs = self.sample(p, n_samples=3000, batch_size=self.val_batch)
         phi, phi2, phi4 = obs['phi'], obs['phi2'], obs['phi4']
         kurt = phi4 / phi2**2 if phi2 > 0 else 0.0
 
@@ -304,13 +331,11 @@ class ValidationSuite:
     def plot_summary(self):
         save_path = self.config['data_dir'] / 'validation_summary.png'
 
-        # Grow the figure vertically if the Minkowski test ran
         has_mink = 'minkowski' in self.results
         nrows    = 4 if has_mink else 3
         fig      = plt.figure(figsize=(20, 5 * nrows))
         gs       = fig.add_gridspec(nrows, 3, hspace=0.55, wspace=0.35)
 
-        # ── Propagator ─────────────────────────────────────────────────
         if 'propagator' in self.results:
             ax  = fig.add_subplot(gs[0, :2])
             res = self.results['propagator']
@@ -336,7 +361,6 @@ class ValidationSuite:
             ax_in.tick_params(labelsize=8)
             ax_in.grid(True, alpha=0.3)
 
-        # ── ESS per test ────────────────────────────────────────────────
         ax_ess = fig.add_subplot(gs[0, 2])
         ekeys  = ['propagator', 'phi2', 'perturbative',
                   'phi6', 'mu', 'consistency', 'minkowski']
@@ -355,7 +379,6 @@ class ValidationSuite:
             ax_ess.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.002,
                         f"N={n}", ha='center', va='bottom', fontsize=7)
 
-        # ── <phi²> free, phi^4, phi^6 ──────────────────────────────────
         for col_i, (key, lbl, clrs) in enumerate([
             ('phi2',        '<φ²> Free',          ['royalblue', 'darkorange']),
             ('perturbative','<φ²> phi^4 g4=0.1',  ['forestgreen', 'crimson']),
@@ -377,7 +400,6 @@ class ValidationSuite:
                         fontweight='bold', fontsize=9)
             ax.grid(True, axis='y', alpha=0.3)
 
-        # ── Chemical potential (Euclidean diagnostics) ──────────────────
         if 'mu' in self.results:
             ax  = fig.add_subplot(gs[2, :2])
             res = self.results['mu']
@@ -395,7 +417,6 @@ class ValidationSuite:
                 fontsize=12)
             ax.grid(True, axis='y', alpha=0.3)
 
-        # ── Consistency table ───────────────────────────────────────────
         if 'consistency' in self.results:
             ax  = fig.add_subplot(gs[2, 2])
             ax.axis('off')
@@ -414,7 +435,6 @@ class ValidationSuite:
             tbl.auto_set_font_size(False); tbl.set_fontsize(10); tbl.scale(1, 2.0)
             ax.set_title("Consistency Summary", fontsize=12)
 
-        # ── Minkowski sign-problem panel (row 3, only if test ran) ──────
         if has_mink:
             res   = self.results['minkowski']
             rows  = res['rows']
@@ -423,7 +443,6 @@ class ValidationSuite:
             ph_v  = [r['avg_phase_M'] for r in rows]
             ess_v = [r['ess_M']       for r in rows]
 
-            # Left: std(Im S_M) vs mu — bar chart with pass/fail colouring
             ax_std = fig.add_subplot(gs[3, 0])
             bar_cols = ['forestgreen' if r['passed'] else 'crimson' for r in rows]
             ax_std.bar([str(m) for m in mu_v], std_v,
@@ -437,7 +456,6 @@ class ValidationSuite:
                 ax_std.text(i, v, f"{v:.3f}", ha='center', va='bottom',
                             fontsize=9, fontweight='bold')
 
-            # Middle: average Minkowski phase |<e^{i Im S_M}>| vs mu
             ax_ph = fig.add_subplot(gs[3, 1])
             ax_ph.plot([str(m) for m in mu_v], ph_v,
                        'o-', color='darkorange', lw=2, ms=8)
@@ -451,7 +469,6 @@ class ValidationSuite:
                 ax_ph.text(i, v + 0.02, f"{v:.3f}", ha='center',
                            fontsize=9, fontweight='bold')
 
-            # Right: Minkowski ESS vs mu
             ax_em = fig.add_subplot(gs[3, 2])
             ax_em.bar([str(m) for m in mu_v], ess_v,
                       color='steelblue', alpha=0.85, edgecolor='k')
@@ -479,7 +496,7 @@ class ValidationSuite:
 
 def run_all_validations(config: dict):
     print("=" * 65)
-    print("VALIDATION SUITE  —  v7")
+    print("VALIDATION SUITE  —  v8")
     print("=" * 65)
     suite = ValidationSuite(config, config['data_dir'] / 'universal_thimble_model.pt')
     suite.test_propagator()

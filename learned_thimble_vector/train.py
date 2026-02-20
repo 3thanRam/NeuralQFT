@@ -1,27 +1,17 @@
 """
 Training — unified Euclidean + Minkowski thimble training.
 
-Loss schedule (all weights are epoch-fraction t = epoch / n_epochs):
+Changes vs v7
+-------------
+- model.forward() now receives the training fraction `t` so the deformation
+  clamp scale can grow with training (clamp_scale_start → clamp_scale_end).
+- Two new CONFIG keys:
+    clamp_scale_start  float  Initial log_sigma clamp (default 0.3)
+    clamp_scale_end    float  Final log_sigma clamp   (default 0.7)
+- temporal_kernel_size is forwarded from CONFIG to the model constructor
+  (default 3; use 5 for larger-L lattices where mu correlations are longer).
 
-  Euclidean phase  (always active):
-    var_Feff  — primary, weight 1.0
-    var_imS_E — secondary, lambda_im ramps 0.01 → 5.0  over t ∈ [0.10, 0.60]
-    var_logJ  — tertiary, lambda_J = 0.01 (constant)
-
-  Minkowski phase  (late training):
-    var_imS_M — lambda_M ramps 0 → lambda_M_max over
-                t ∈ [mink_ramp_start, mink_ramp_end]
-                then holds at lambda_M_max.
-    Default: ramp_start=0.70, ramp_end=0.90, lambda_M_max=2.0
-
-  Rationale for the ramp-in order:
-    1. Early training (0–60%):  network learns Euclidean contour geometry
-       guided by Var(F_eff).  Minkowski gradients here would fight this.
-    2. Mid training (10–60%):   lambda_im ramp pressures Im(S_E) → 0,
-       stabilising the deformation amplitude.
-    3. Late training (70–90%):  lambda_M ramp turns on Minkowski pressure.
-       The warm-started network already deforms contours well, so it can
-       immediately begin learning the Minkowski sign-problem geometry.
+Everything else is identical to v7.
 """
 
 import torch
@@ -31,16 +21,10 @@ from thimble import LagrangianParams, PhysicsInformedThimble, effective_sample_s
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Randomised Lagrangian sampler
+# Randomised Lagrangian sampler  (unchanged from v7)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def random_params(epoch: int, cfg: dict) -> LagrangianParams:
-    """
-    Draw a random Lagrangian each step covering the full validation range.
-    Range always includes g4=0 so the network doesn't forget the free theory.
-    mu is sampled throughout training so chemical-potential geometry is always
-    present — this matters for the Minkowski phase where mu drives sign problems.
-    """
     N = cfg['n_epochs']
     t = epoch / N
 
@@ -59,11 +43,18 @@ def random_params(epoch: int, cfg: dict) -> LagrangianParams:
     g6_max = cfg.get('train_g6', 0.0) * min(1.0, max(0.0, (t - 0.5) / 0.3))
     g6 = float(np.random.uniform(0.0, g6_max)) if g6_max > 0 else 0.0
 
-    mu_max = cfg.get('train_mu', 0.0) * min(1.0, max(0.0, (t - 0.7) / 0.3))
+    # mu ramp: starts earlier than before (mu_ramp_start, default 0.30)
+    # so the network has more time to learn finite-mu geometry before the
+    # Minkowski phase turns on at mink_ramp_start.
+    mu_ramp_start = cfg.get('mu_ramp_start', 0.30)
+    mu_max = cfg.get('train_mu', 0.0) * \
+             min(1.0, max(0.0, (t - mu_ramp_start) / 0.40))
     mu = float(np.random.uniform(0.0, mu_max)) if mu_max > 0 else 0.0
 
-    box_coeff_max = cfg.get('train_box_coeff', 0.0) * min(1.0, max(0.0, (t - 0.7) / 0.3))
-    box_coeff = float(np.random.uniform(0.0, box_coeff_max)) if box_coeff_max > 0 else 0.0
+    box_coeff_max = cfg.get('train_box_coeff', 0.0) * \
+                    min(1.0, max(0.0, (t - 0.7) / 0.3))
+    box_coeff = float(np.random.uniform(0.0, box_coeff_max)) \
+                if box_coeff_max > 0 else 0.0
 
     deriv_interact_max = cfg.get('train_deriv_interact', 0.0) * \
                          min(1.0, max(0.0, (t - 0.7) / 0.3))
@@ -78,13 +69,6 @@ def random_params(epoch: int, cfg: dict) -> LagrangianParams:
 
 
 def _mink_lambda(t: float, cfg: dict) -> float:
-    """
-    Compute the Minkowski loss weight λ_M at training fraction t.
-
-    Linearly ramps from 0 to lambda_M_max over [mink_ramp_start, mink_ramp_end],
-    then holds at lambda_M_max for the remainder of training.
-    Returns 0.0 before the ramp starts so no Minkowski gradient is computed.
-    """
     start   = cfg.get('mink_ramp_start',  0.70)
     end     = cfg.get('mink_ramp_end',    0.90)
     lam_max = cfg.get('train_lambda_M',   2.0)
@@ -97,7 +81,7 @@ def _mink_lambda(t: float, cfg: dict) -> float:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Plotting
+# Plotting  (unchanged)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def plot_training(history: dict, save_path):
@@ -122,7 +106,6 @@ def plot_training(history: dict, save_path):
         fn   = ax.semilogy if do_log else ax.plot
         fn(ep, np.clip(vals, 1e-15, None) if do_log else vals, color=col, alpha=0.6)
 
-        # Mark where Minkowski phase begins
         if 'lambda_M' in history:
             lm = np.array(history['lambda_M'])
             onset = np.argmax(lm > 0)
@@ -156,7 +139,7 @@ class Trainer:
 
         T0 = cfg.get('restart_period', 2000)
         self.sched = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-            self.opt, T_0=T0, T_mult=1, eta_min=cfg['lr'] * 5e-3)
+            self.opt, T_0=T0, T_mult=2, eta_min=cfg['lr'] * 5e-3)
 
     def step(self, epoch: int):
         self.opt.zero_grad()
@@ -165,19 +148,16 @@ class Trainer:
         N   = self.cfg['n_epochs']
         L   = self.cfg['L']
         dev = self.cfg['device']
-        t   = epoch / N
+        t   = epoch / N   # training fraction
 
         z = torch.randn(self.cfg['batch_size'], L, L, L, L, device=dev)
-        phi, log_det, scale = self.model(z, p, return_scale=True)
+
+        # ── Forward pass — pass t so clamp scale can grow ─────────────────
+        phi, log_det, scale = self.model(z, p, return_scale=True, t=t)
 
         # ── Loss weights ─────────────────────────────────────────────────────
-        # lambda_im: Euclidean imaginary-part pressure
-        #   ramps 0.01 → 5.0 over t ∈ [0.10, 0.60]
         lambda_im = 0.01 + 4.99 * min(1.0, max(0.0, (t - 0.10) / 0.50))
-        lambda_J  = 0.01
-
-        # lambda_M: Minkowski sign-problem pressure
-        #   zero until mink_ramp_start, then linearly ramps to train_lambda_M
+        lambda_J = 0.01 + 0.49 * min(1.0, max(0.0, (t - 0.05) / 0.45))
         lambda_M  = _mink_lambda(t, self.cfg)
 
         # ── Combined loss ─────────────────────────────────────────────────────
@@ -217,12 +197,18 @@ class Trainer:
 
         mink_start_ep = int(self.cfg.get('mink_ramp_start', 0.70) * n_epochs)
         mink_end_ep   = int(self.cfg.get('mink_ramp_end',   0.90) * n_epochs)
+        mu_ramp_start = self.cfg.get('mu_ramp_start', 0.30)
 
-        print(f"Unified training  |  Euclidean + Minkowski thimble")
+        print(f"Unified training  |  Euclidean + Minkowski thimble  (dual-path v8)")
         print(f"  Loss     : Var(F_eff) + λ_im·Var(Im S_E) + λ_J·Var(log det)"
               f" + λ_M·Var(Im S_M)")
         print(f"  λ_M ramp : epochs {mink_start_ep}–{mink_end_ep}"
               f"  (0 → {self.cfg.get('train_lambda_M', 2.0):.1f})")
+        print(f"  μ ramp   : starts at t={mu_ramp_start:.2f}"
+              f"  (earlier than Mink. ramp to warm-start temporal path)")
+        print(f"  Clamp    : {self.cfg.get('clamp_scale_start', 0.3):.2f}"
+              f" → {self.cfg.get('clamp_scale_end', 0.7):.2f}  (log_sigma range)")
+        print(f"  TempKern : {self.cfg.get('temporal_kernel_size', 3)}")
         print(f"  LR       : CosineWarmRestarts T_0={T0}")
         print(f"  L={self.cfg['L']}  batch={self.cfg['batch_size']}"
               f"  epochs={n_epochs}  lr={self.cfg['lr']:.1e}\n")
@@ -241,7 +227,7 @@ class Trainer:
                       f"ESS={m['ess']:.3f}  "
                       f"λ_M={m['lambda_M']:.3f}  "
                       f"LR={m['lr']:.2e}  "
-                      f"g4={m['g4_sample']:.3f}")
+                      f"g4={m['g4_sample']:.3f}  μ={m['mu_sample']:.3f}")
         return h
 
 

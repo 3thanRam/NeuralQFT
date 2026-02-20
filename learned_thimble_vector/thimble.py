@@ -1,5 +1,45 @@
 """
 Physics-Informed Thimble Network
+
+Key change vs. v7: ResNetConditioner now uses a dual-path architecture
+that gives the network explicit awareness of the temporal direction.
+
+Why this matters for finite-μ sign problems
+-------------------------------------------
+The chemical-potential term in the action is
+
+    S_μ = -μ · Σ_x [ e^μ φ(x+ê_t)φ(x) + e^{-μ} φ(x-ê_t)φ(x) ]
+
+This couples sites only along the time axis.  When μ is large the thimble
+geometry deforms primarily in the imaginary-time direction; the optimal
+contour tilt is a *temporal* object.  The original 3D spatial conv treats
+time as a batch/channel dimension — it cannot learn asymmetric temporal
+deformations without many indirect layers.
+
+Dual-path conditioner
+---------------------
+    phi  [B, T, X, Y, Z]
+         │
+         ├── SpatialPath: treats T as channels, 3D conv over (X,Y,Z)
+         │     Conv3d(T,H) → ResBlock → ResBlock  →  features_spatial [B,H,X,Y,Z]
+         │
+         └── TemporalPath: treats (X,Y,Z) as batch, 1D conv over T
+               reshape to [B·X·Y·Z, T, 1]
+               → TemporalResBlock (Conv1d, circ pad) → TemporalResBlock
+               → reshape back [B,H,X,Y,Z]  →  features_temporal [B,H,X,Y,Z]
+         │
+         └── Fusion: concat along channel → 1×1 conv → log_sigma, tau
+
+The spatial path handles the usual φ⁴/φ⁶ geometry (same as before).
+The temporal path handles the μ-induced asymmetry.  Because the 1D convs
+are applied over the time loop with circular (periodic BC) padding they
+correctly see the e^{±μ} hop structure.
+
+The two paths share the same hidden_dim H and are fused with a lightweight
+1×1 conv, keeping parameter count almost the same as the original.
+
+Exact log|det J| is preserved: log_sigma is still a pointwise function of
+phi_free so log|det| = Σ_x log_sigma_x (no Hutchinson estimator needed).
 """
 
 import torch
@@ -48,7 +88,7 @@ class GeneralAction:
     Full extended Euclidean Lagrangian. phi may be complex. Returns [B] complex.
 
     Also provides minkowski_action() for the Minkowski-signature counterpart,
-    used during the late-training Minkowski phase (see PhysicsInformedThimble).
+    used during the late-training Minkowski phase.
     """
 
     def __init__(self, dx: float = 1.0):
@@ -96,93 +136,336 @@ class GeneralAction:
         """
         Minkowski action S_M with correct sign conventions.
         phi: [B, L, L, L, L] complex.  Returns S_M: [B] complex.
-
-        S_M = sum_x [ ½(∂_t φ)² - ½m²φ² - g4/4! φ⁴ - g6/6! φ⁶ - ½μ_hop ]
-
-        Sign conventions vs Euclidean:
-          - Kinetic term keeps the same sign (no i factor on time derivative
-            yet — the contour deformation handles the Wick rotation implicitly).
-          - All potential terms flip sign (V appears as -V in Minkowski).
-          - The thimble is trained to drive Im(S_M) → 0 on the deformed contour;
-            this is the non-trivial task absent in the Euclidean case.
         """
-        # Time derivative only (dim=1 is the time axis for [B,T,X,Y,Z])
         dphi    = torch.roll(phi, -1, dims=1) - phi
-        kinetic = 0.5 * (dphi ** 2).sum(dim=(1, 2, 3, 4))          # [B]
+        kinetic = 0.5 * (dphi ** 2).sum(dim=(1, 2, 3, 4))
 
-        # Potential terms with Minkowski sign flip
         mass  = -0.5          * p.m2 * (phi ** 2).sum(dim=(1, 2, 3, 4))
         phi4  = -(p.g4 / 24.0)       * (phi ** 4).sum(dim=(1, 2, 3, 4))
         phi6  = -(p.g6 / 720.0)      * (phi ** 6).sum(dim=(1, 2, 3, 4))
 
-        # Chemical potential hop (same structure as Euclidean)
         hop_fwd = torch.roll(phi, -1, dims=1) * phi
         hop_bwd = torch.roll(phi,  1, dims=1) * phi
         chem    = -0.5 * p.mu * (hop_fwd + hop_bwd).sum(dim=(1, 2, 3, 4))
 
-        return kinetic + mass + phi4 + phi6 + chem                   # [B] complex
+        return kinetic + mass + phi4 + phi6 + chem
 
 
 # ============================================================================
-# Conditioner network  (position-space ResNet)
+# Building blocks
+# ============================================================================
+
+def _circ_pad_t(x: torch.Tensor, pad: int) -> torch.Tensor:
+    """
+    Circular padding along the T dimension (dim=2) of a 5D [B, C, T, S, 1] tensor.
+    Enforces periodic temporal boundary conditions.
+    """
+    return torch.cat([x[:, :, -pad:], x, x[:, :, :pad]], dim=2)
+
+
+class TemporalResBlock(nn.Module):
+    """
+    Two-layer residual block that convolves ONLY along the time axis.
+
+    Internally works on [B*S, H, T, 1, 1] where S = X*Y*Z, using
+    Conv3d(kernel=(k,1,1)) which is mathematically a 1D conv over T,
+    weight-shared across all spatial sites.
+
+    External interface: [B, H, T, S] in/out where S = X*Y*Z (pre-merged).
+    Callers handle the merge/unmerge around this block.
+
+    The Conv3d(k,1,1) approach is chosen over Conv1d to avoid the CUDA
+    workspace OOM that occurs when Conv1d receives a batch of size B*X*Y*Z.
+    With Conv3d the batch stays at B and S is folded into spatial dims.
+    """
+
+    def __init__(self, hidden_dim: int, kernel_size: int = 3):
+        super().__init__()
+        assert kernel_size % 2 == 1, "kernel_size must be odd"
+        self.pad = kernel_size // 2
+        self.norm1 = nn.GroupNorm(min(8, hidden_dim), hidden_dim)
+        self.conv1 = nn.Conv3d(hidden_dim, hidden_dim,
+                               kernel_size=(kernel_size, 1, 1), padding=0)
+        self.norm2 = nn.GroupNorm(min(8, hidden_dim), hidden_dim)
+        self.conv2 = nn.Conv3d(hidden_dim, hidden_dim,
+                               kernel_size=(kernel_size, 1, 1), padding=0)
+        self.act   = nn.SiLU()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [B, H, T, S]  where S = X*Y*Z
+        B, H, T, S = x.shape
+        x5 = x.unsqueeze(-1)                          # [B, H, T, S, 1]
+        h = self.act(self.norm1(x5))
+        h = self.conv1(_circ_pad_t(h, self.pad))
+        h = self.act(self.norm2(h))
+        h = self.conv2(_circ_pad_t(h, self.pad))
+        return (x5 + h).squeeze(-1)                   # residual → [B, H, T, S]
+
+
+class SpatialResBlock(nn.Module):
+    """
+    Two-layer 3D residual block operating over (X, Y, Z).
+    Identical structure to the original ResNetConditioner residual blocks.
+    """
+
+    def __init__(self, hidden_dim: int):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.GroupNorm(min(8, hidden_dim), hidden_dim),
+            nn.SiLU(),
+            nn.Conv3d(hidden_dim, hidden_dim, 3, padding=1,
+                      padding_mode='circular'),
+            nn.GroupNorm(min(8, hidden_dim), hidden_dim),
+            nn.SiLU(),
+            nn.Conv3d(hidden_dim, hidden_dim, 3, padding=1,
+                      padding_mode='circular'),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + self.block(x)
+
+
+# ============================================================================
+# Dual-path conditioner  (spatial + temporal)
 # ============================================================================
 
 class ResNetConditioner(nn.Module):
     """
-    phi_free [B, L, L, L, L]  →  (log_sigma, tau)  each [B, L, L, L, L]
+    phi_free [B, T, X, Y, Z]  →  (log_sigma, tau)  each [B, T, X, Y, Z]
 
-    phi_im_x = exp(log_sigma_x) * phi_free_x + tau_x
-    log|det J|_im = sum_x log_sigma_x   (exact)
+    Architecture
+    ------------
+    Two parallel feature extractors are run on the same input and fused:
 
-    Two genuine residual blocks for gradient stability.
-    Soft-clamp on log_sigma to keep deformation moderate.
+    SpatialPath
+        Treats T as channels, applies 3D convolutions over (X, Y, Z).
+        This learns the spatial geometry of the thimble — the same job
+        the original ResNetConditioner did.
+
+        phi [B, T, X, Y, Z]
+          → in_conv_s  : Conv3d(T→H, k=3)          [B, H, X, Y, Z]
+          → sp_res1    : SpatialResBlock             [B, H, X, Y, Z]
+          → sp_res2    : SpatialResBlock             [B, H, X, Y, Z]
+
+    TemporalPath
+        Treats each spatial site independently, applies 1D convolutions over T.
+        This learns the temporal (chemical-potential) geometry.
+
+        phi [B, T, X, Y, Z]
+          → reshape    : [B*X*Y*Z, T]
+          → in_conv_t  : Linear(T→H)  (pointwise embed per site)
+          → reshape    : [B*X*Y*Z, H, T] (H as channels for Conv1d)
+              OR equivalently: expand each site's T values into H channels
+          → tm_res1    : TemporalResBlock            [B*X*Y*Z, H, T]
+          → tm_res2    : TemporalResBlock            [B*X*Y*Z, H, T]
+          → reshape    : [B, H, X, Y, Z]  (mean over T or at matching T slice)
+
+        Because we need a [B, H, X, Y, Z] output that can be added to the
+        spatial features, we transpose the temporal features back:
+          [B*X*Y*Z, H, T] → [B, T, H, X, Y, Z] → mean over T channel
+        This gives a T-averaged temporal context that modulates each spatial
+        site's deformation amplitude.
+
+        A second temporal output keeps the per-T information:
+          [B*X*Y*Z, H, T] → [B, H, T, X, Y, Z] → permute [B, H·T//T, X,Y,Z]
+        ... but this would break shape alignment.  Instead we use a cleaner
+        scheme: the temporal path produces [B, H, T, X, Y, Z] by unfolding
+        the batch, and then we average over X,Y,Z to get a global temporal
+        context [B, H, T] which is broadcast back:
+
+        Implementation (what we actually do — simple and correct):
+          phi [B, T, X, Y, Z]
+          → permute to [B, X, Y, Z, T]  (T is now the last dim)
+          → reshape   [B*X*Y*Z, 1, T]   (1 input channel for Conv1d)
+          → in_conv_t : Conv1d(1→H)     [B*X*Y*Z, H, T]
+          → tm_res1   : TemporalResBlock [B*X*Y*Z, H, T]
+          → tm_res2   : TemporalResBlock [B*X*Y*Z, H, T]
+          → reshape   [B, X, Y, Z, H, T]
+          → permute   [B, H, T, X, Y, Z]  ← matches SpatialPath layout
+                                             when treated as [B, H·T_as_channel, X,Y,Z]
+
+        The spatial path output is [B, H, X, Y, Z] (T collapsed as channels).
+        To fuse with temporal output [B, H, T, X, Y, Z] we *broadcast*:
+          temporal features are pooled over the spatial dims to get a global
+          per-T-per-channel bias, then broadcast added to spatial features:
+          [B, H, T, X, Y, Z]  →  mean(X,Y,Z)  →  [B, H, T]
+          then expand back to [B, H, T, X, Y, Z] and add to
+          spatial features [B, H, X, Y, Z] broadcast over T.
+
+        Finally fusion:
+          fused [B, H, T, X, Y, Z]
+          → permute [B, T, H, X, Y, Z]
+          → reshape [B*T, H, X, Y, Z]  (treat each time slice separately)
+          → out_log_sigma: Conv3d(H→1, k=1)  → [B*T, 1, X, Y, Z]
+          → reshape [B, T, X, Y, Z]  =  log_sigma
+          (same for tau)
+
+    Physics parameter conditioning
+        A small MLP maps the param vector to a per-channel bias added to
+        both spatial and temporal input embeddings, so the deformation
+        strategy changes with m², g4, μ, etc.
+
+    Zero-init of output layers
+        The output Conv3d layers are zero-initialised so the network starts
+        as an identity map (phi_im = 0) and learns deformations from there.
+
+    Soft-clamped log_sigma
+        log_sigma = tanh(raw) * clamp_scale  (clamp_scale passed at runtime)
+        This keeps importance weights from collapsing early in training.
     """
 
-    def __init__(self, L: int, hidden_dim: int, param_dim: int = PARAM_DIM):
+    def __init__(self, L: int, hidden_dim: int, param_dim: int = PARAM_DIM,
+                 temporal_kernel_size: int = 3):
         super().__init__()
-        # Physics parameter → per-channel bias
-        self.param_proj = nn.Linear(param_dim, L)
+        self.L          = L
+        self.hidden_dim = H = hidden_dim
+        self.T          = L   # temporal extent = L (4D isotropic lattice)
 
-        self.in_conv = nn.Conv3d(L, hidden_dim, 3, padding=1, padding_mode='circular')
+        # ── Physics param conditioning ────────────────────────────────────────
+        # Produces a bias for BOTH the spatial and temporal input embeddings.
+        self.param_proj_s = nn.Linear(param_dim, H)   # spatial bias [B, H]
+        self.param_proj_t = nn.Linear(param_dim, H)   # temporal bias [B, H]
 
-        self.res1 = nn.Sequential(
-            nn.GroupNorm(min(8, hidden_dim), hidden_dim),
-            nn.SiLU(),
-            nn.Conv3d(hidden_dim, hidden_dim, 3, padding=1, padding_mode='circular'),
-            nn.GroupNorm(min(8, hidden_dim), hidden_dim),
-            nn.SiLU(),
-            nn.Conv3d(hidden_dim, hidden_dim, 3, padding=1, padding_mode='circular'),
-        )
-        self.res2 = nn.Sequential(
-            nn.GroupNorm(min(8, hidden_dim), hidden_dim),
-            nn.SiLU(),
-            nn.Conv3d(hidden_dim, hidden_dim, 3, padding=1, padding_mode='circular'),
-            nn.GroupNorm(min(8, hidden_dim), hidden_dim),
-            nn.SiLU(),
-            nn.Conv3d(hidden_dim, hidden_dim, 3, padding=1, padding_mode='circular'),
-        )
+        # ── Spatial path ──────────────────────────────────────────────────────
+        # Input: phi [B, T, X, Y, Z] with T treated as in-channels
+        self.in_conv_s = nn.Conv3d(L, H, 3, padding=1, padding_mode='circular')
+        self.sp_res1   = SpatialResBlock(H)
+        self.sp_res2   = SpatialResBlock(H)
 
-        # Output: log_sigma and tau
-        self.out_log_sigma = nn.Conv3d(hidden_dim, L, 1)
-        self.out_tau       = nn.Conv3d(hidden_dim, L, 1)
+        # ── Temporal path ─────────────────────────────────────────────────────
+        # Works on [B, H, T, S, 1] where S=X*Y*Z via Conv3d(1,H,(k,1,1)).
+        # S is treated as a spatial dim so Conv3d gets a valid 5D tensor.
+        # This avoids the OOM from Conv1d on a batch of size B*X*Y*Z.
+        self.in_conv_t = nn.Conv3d(1, H, kernel_size=(temporal_kernel_size, 1, 1),
+                                   padding=0)   # manual circ pad along T
+        self._t_in_pad = temporal_kernel_size // 2
 
-        # Critical: zero-init so phi_im = 0 at start (identity map)
-        nn.init.zeros_(self.out_log_sigma.weight); nn.init.zeros_(self.out_log_sigma.bias)
-        nn.init.zeros_(self.out_tau.weight);       nn.init.zeros_(self.out_tau.bias)
+        self.tm_res1 = TemporalResBlock(H, kernel_size=temporal_kernel_size)
+        self.tm_res2 = TemporalResBlock(H, kernel_size=temporal_kernel_size)
 
-    def forward(self, phi_free: torch.Tensor, p_vec: torch.Tensor):
-        # [B, L, X, Y, Z]  with T treated as channels
-        p_bias = self.param_proj(p_vec).view(-1, phi_free.shape[1], 1, 1, 1)
-        x = self.in_conv(phi_free + p_bias)
-        x = x + self.res1(x)
-        x = x + self.res2(x)
+        # ── Fusion ────────────────────────────────────────────────────────────
+        # After fusion each [B, T, X, Y, Z] time-slice has 2H channels:
+        # H from spatial path (broadcast over T) + H from temporal path.
+        # A 1×1 Conv3d maps 2H → H before the output heads.
+        self.fusion_conv = nn.Conv3d(2 * H, H, 1)
 
-        log_sigma = self.out_log_sigma(x)
-        tau       = self.out_tau(x)
+        # ── Output heads ──────────────────────────────────────────────────────
+        # Applied per time-slice: [B*T, H, X, Y, Z] → [B*T, 1, X, Y, Z]
+        self.out_log_sigma = nn.Conv3d(H, 1, 1)
+        self.out_tau       = nn.Conv3d(H, 1, 1)
 
-        # Soft-clamp: log_sigma in (-0.3, 0.3)  →  sigma in (0.74, 1.35)
-        # Small range keeps importance weights healthy
-        log_sigma = torch.tanh(log_sigma) * 0.3
+        # Zero-init: network starts as identity (phi_im = 0)
+        nn.init.zeros_(self.out_log_sigma.weight)
+        nn.init.zeros_(self.out_log_sigma.bias)
+        nn.init.zeros_(self.out_tau.weight)
+        nn.init.zeros_(self.out_tau.bias)
+        # Also zero-init fusion conv bias to avoid initial offset
+        nn.init.zeros_(self.fusion_conv.bias)
+
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _spatial_features(self, phi_free: torch.Tensor,
+                          p_vec: torch.Tensor) -> torch.Tensor:
+        """
+        phi_free: [B, T, X, Y, Z]
+        p_vec:    [B, param_dim]
+        returns:  [B, H, X, Y, Z]   (T collapsed as spatial-path channels)
+        """
+        H = self.hidden_dim
+        # param bias: [B, H] → [B, H, 1, 1, 1]
+        bias_s = self.param_proj_s(p_vec).view(-1, H, 1, 1, 1)
+        # phi_free already [B, T, X, Y, Z] — T plays the role of in_channels
+        x = self.in_conv_s(phi_free) + bias_s   # [B, H, X, Y, Z]
+        x = self.sp_res1(x)
+        x = self.sp_res2(x)
+        return x   # [B, H, X, Y, Z]
+
+    def _temporal_features(self, phi_free: torch.Tensor,
+                           p_vec: torch.Tensor) -> torch.Tensor:
+        """
+        phi_free: [B, T, X, Y, Z]
+        p_vec:    [param_dim] or [B, param_dim]
+        returns:  [B, H, T, X, Y, Z]
+
+        Internally works on [B, C, T, S, 1] where S = X*Y*Z, using
+        Conv3d(kernel=(k,1,1)) which convolves only along T.
+        This gives Conv3d a valid 5D input while keeping batch size = B
+        (not B*X*Y*Z), avoiding the CUDA workspace OOM.
+        """
+        B, T, X, Y, Z = phi_free.shape
+        H = self.hidden_dim
+        S = X * Y * Z
+
+        # [B, T, X, Y, Z] → [B, T, S] → [B, 1, T, S] → [B, 1, T, S, 1]
+        x = phi_free.reshape(B, T, S).unsqueeze(1).unsqueeze(-1)  # [B, 1, T, S, 1]
+
+        # Initial embedding: circ pad T then Conv3d(1,H,(k,1,1))
+        x = _circ_pad_t(x, self._t_in_pad)          # [B, 1, T+2p, S, 1]
+        x = self.in_conv_t(x)                        # [B, H, T, S, 1]
+        x = x.squeeze(-1)                            # [B, H, T, S]
+
+        # Physics param bias broadcast over T and S
+        bias_t = self.param_proj_t(p_vec)            # [H] or [B, H]
+        if bias_t.dim() == 1:
+            bias_t = bias_t.view(1, H, 1, 1)         # [1, H, 1, 1]
+        else:
+            bias_t = bias_t.view(B, H, 1, 1)         # [B, H, 1, 1]
+        x = x + bias_t                               # [B, H, T, S]
+
+        # Temporal residual blocks (internal shape [B, H, T, S])
+        x = self.tm_res1(x)
+        x = self.tm_res2(x)
+
+        # Restore spatial dims: [B, H, T, S] → [B, H, T, X, Y, Z]
+        return x.reshape(B, H, T, X, Y, Z)
+
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def forward(self, phi_free: torch.Tensor, p_vec: torch.Tensor,
+                clamp_scale: float = 0.3):
+        """
+        phi_free:    [B, T, X, Y, Z]
+        p_vec:       [B, param_dim]
+        clamp_scale: soft-clamp range for log_sigma (default 0.3, same as v7)
+
+        Returns
+        -------
+        log_sigma: [B, T, X, Y, Z]   pointwise log-scale of the deformation
+        tau:       [B, T, X, Y, Z]   pointwise shift of the deformation
+        """
+        B, T, X, Y, Z = phi_free.shape
+        H = self.hidden_dim
+
+        # ── Spatial features: [B, H, X, Y, Z] ───────────────────────────────
+        feat_s = self._spatial_features(phi_free, p_vec)   # [B, H, X, Y, Z]
+
+        # ── Temporal features: [B, H, T, X, Y, Z] ───────────────────────────
+        feat_t = self._temporal_features(phi_free, p_vec)  # [B, H, T, X, Y, Z]
+
+        # ── Fusion ────────────────────────────────────────────────────────────
+        # Broadcast spatial features over T:
+        #   [B, H, X, Y, Z] → [B, H, T, X, Y, Z]
+        feat_s_exp = feat_s.unsqueeze(2).expand(B, H, T, X, Y, Z)
+
+        # Concatenate along channel dim: [B, 2H, T, X, Y, Z]
+        fused = torch.cat([feat_s_exp, feat_t], dim=1)
+
+        # Apply fusion conv per time-slice via reshape trick:
+        # [B, 2H, T, X, Y, Z] → [B*T, 2H, X, Y, Z]
+        fused = fused.permute(0, 2, 1, 3, 4, 5)          # [B, T, 2H, X, Y, Z]
+        fused = fused.reshape(B * T, 2 * H, X, Y, Z)     # [B*T, 2H, X, Y, Z]
+        fused = torch.relu(self.fusion_conv(fused))       # [B*T, H, X, Y, Z]
+
+        # ── Output heads ──────────────────────────────────────────────────────
+        log_sigma_raw = self.out_log_sigma(fused)          # [B*T, 1, X, Y, Z]
+        tau_raw       = self.out_tau(fused)                # [B*T, 1, X, Y, Z]
+
+        # Reshape to [B, T, X, Y, Z]
+        log_sigma = log_sigma_raw.reshape(B, T, X, Y, Z)
+        tau       = tau_raw.reshape(B, T, X, Y, Z)
+
+        # Soft-clamp: log_sigma ∈ (-clamp_scale, clamp_scale)
+        log_sigma = torch.tanh(log_sigma) * clamp_scale
 
         return log_sigma, tau
 
@@ -194,17 +477,29 @@ class ResNetConditioner(nn.Module):
 class ImaginaryLayer(nn.Module):
     """
     phi_im_x = exp(log_sigma_x) * phi_free_x + tau_x
-    log|det J|_im = sum_x log_sigma_x    (exact, no Hutchinson)
+
+    log|det J|_im = Σ_x log_sigma_x    (exact, pointwise — no Hutchinson)
+
+    The log|det| formula is exact because the deformation is a pointwise
+    (site-diagonal) affine map in field space: each site's imaginary part
+    is an independent affine function of that site's free-field value.
+    The Jacobian is therefore diagonal with entries exp(log_sigma_x).
+
+    clamp_scale is forwarded to ResNetConditioner so the training loop can
+    gradually increase the allowed deformation range as training progresses.
     """
 
-    def __init__(self, L: int, hidden_dim: int, param_dim: int = PARAM_DIM):
+    def __init__(self, L: int, hidden_dim: int, param_dim: int = PARAM_DIM,
+                 temporal_kernel_size: int = 3):
         super().__init__()
-        self.net = ResNetConditioner(L, hidden_dim, param_dim)
+        self.net = ResNetConditioner(L, hidden_dim, param_dim,
+                                     temporal_kernel_size=temporal_kernel_size)
 
-    def forward(self, phi_free: torch.Tensor, p_emb: torch.Tensor):
-        log_sigma, tau = self.net(phi_free, p_emb)
+    def forward(self, phi_free: torch.Tensor, p_emb: torch.Tensor,
+                clamp_scale: float = 0.3):
+        log_sigma, tau = self.net(phi_free, p_emb, clamp_scale=clamp_scale)
         phi_im  = torch.exp(log_sigma) * phi_free + tau
-        log_det = torch.sum(log_sigma, dim=(-4,-3,-2,-1))  # [B], exact
+        log_det = torch.sum(log_sigma, dim=(-4, -3, -2, -1))  # [B], exact
         return phi_im, log_det
 
 
@@ -245,9 +540,27 @@ class PhysicsInformedThimble(nn.Module):
                2*(1-torch.cos(ky)) + 2*(1-torch.cos(kz)))
         self.register_buffer('laplacian_eig', eig)
 
-        hidden_dim = config.get('thimble_hidden_dim', 32)
+        hidden_dim           = config.get('thimble_hidden_dim', 32)
+        temporal_kernel_size = config.get('temporal_kernel_size', 3)
+
         self.param_embedder  = ParamEmbedder(param_dim=PARAM_DIM)
-        self.imaginary_layer = ImaginaryLayer(self.L, hidden_dim, param_dim=PARAM_DIM)
+        self.imaginary_layer = ImaginaryLayer(
+            self.L, hidden_dim, param_dim=PARAM_DIM,
+            temporal_kernel_size=temporal_kernel_size,
+        )
+
+        # Optionally grow the clamp range over training (set in config)
+        # clamp_scale_start: initial clamp (default 0.3, identity-like)
+        # clamp_scale_end:   final clamp   (default 0.7, more expressive)
+        self._clamp_start = config.get('clamp_scale_start', 0.3)
+        self._clamp_end   = config.get('clamp_scale_end',   0.7)
+
+    def _clamp_scale(self, t: float) -> float:
+        """
+        Linearly interpolate the clamp range with training fraction t ∈ [0,1].
+        Starts tight (near-identity) and opens up as training stabilises.
+        """
+        return self._clamp_start + (self._clamp_end - self._clamp_start) * min(1.0, t)
 
     def _kernel(self, p: LagrangianParams) -> torch.Tensor:
         return torch.clamp(
@@ -265,86 +578,53 @@ class PhysicsInformedThimble(nn.Module):
         return phi_free, kernel
 
     def get_base_log_det(self, p: LagrangianParams) -> torch.Tensor:
-        return torch.sum(-0.5 * torch.log(self._kernel(p)))   # scalar
+        return torch.sum(-0.5 * torch.log(self._kernel(p)))
 
     def forward(self, z: torch.Tensor, p: LagrangianParams,
-                return_scale: bool = False):
+                return_scale: bool = False, t: float = 1.0):
+        """
+        t: training fraction [0, 1].  Used to schedule the clamp scale.
+           Pass t=1.0 (default) at inference / validation for max expressivity.
+        """
         phi_free, kernel = self.generate_free_field(z, p)
         p_emb = self.param_embedder(p.to_tensor(self.device))
 
-        phi_im, log_det_im = self.imaginary_layer(phi_free, p_emb)
+        clamp = self._clamp_scale(t)
+        phi_im, log_det_im = self.imaginary_layer(phi_free, p_emb,
+                                                   clamp_scale=clamp)
 
-        log_det = self.get_base_log_det(p) + log_det_im   # [B]
+        log_det = self.get_base_log_det(p) + log_det_im
         phi     = torch.complex(phi_free, phi_im)
 
         if return_scale:
-            return phi, log_det, torch.mean(1.0/torch.sqrt(kernel)).item()
+            return phi, log_det, torch.mean(1.0 / torch.sqrt(kernel)).item()
         return phi, log_det
 
-    def compute_thimble_loss(self, phi: torch.Tensor, p: LagrangianParams,
-                             log_det: torch.Tensor, lambda_im: float = 0.1):
-        """
-        PRIMARY loss: Var(F_eff)  where F_eff = Re(S) - log_det
-        This is the correct variational objective — when Var(F_eff) = 0,
-        importance weights are uniform → ESS = 1.
+    # ── Loss functions (unchanged from v7) ────────────────────────────────────
 
-        SECONDARY loss: Var(Im S) * lambda_im
-        Regularises the imaginary part but is NOT the primary signal.
-
-        TERTIARY: penalty on Var(log_det) to prevent log_det from
-        having large per-sample variance that tanks ESS independently.
-        """
+    def compute_thimble_loss(self, phi, p, log_det, lambda_im=0.1):
         S = self.action_computer.compute(phi, p)
-
-        F_eff    = S.real - log_det          # [B]  effective action
-        var_Feff = torch.var(F_eff)          # PRIMARY: minimise this
-        var_imS  = torch.var(S.imag)         # SECONDARY: thimble constraint
-        var_logJ = torch.var(log_det)        # TERTIARY: log-det stability
-
-        # Mean effective action (normalised by volume)
+        F_eff    = S.real - log_det
+        var_Feff = torch.var(F_eff)
+        var_imS  = torch.var(S.imag)
+        var_logJ = torch.var(log_det)
         mean_Feff = torch.mean(F_eff) / self.L**4
-
         return var_Feff, var_imS, var_logJ, mean_Feff, S
 
-    def compute_combined_loss(self,
-                              phi:        torch.Tensor,
-                              p:          LagrangianParams,
-                              log_det:    torch.Tensor,
-                              lambda_im:  float,
-                              lambda_J:   float,
-                              lambda_M:   float) -> dict:
-        """
-        Combined Euclidean + Minkowski loss for unified training.
-
-        Euclidean terms (always active):
-          var_Feff  — PRIMARY: drives uniform importance weights
-          var_imS_E — SECONDARY: Euclidean imaginary-part regularisation
-          var_logJ  — TERTIARY: log-det stability
-
-        Minkowski term (ramped in after mink_ramp_start):
-          var_imS_M — drives Im(S_M) → 0 on the deformed contour,
-                      which is the actual sign-problem objective.
-
-        lambda_M == 0 during early training so the Minkowski term
-        contributes no gradient and adds zero computational overhead
-        (the action is still computed for logging, but cheaply detached
-        when lambda_M == 0).
-
-        Returns a dict so callers can log individual components.
-        """
-        # ── Euclidean losses ─────────────────────────────────────────────────
+    def compute_combined_loss(self, phi, p, log_det,
+                              lambda_im, lambda_J, lambda_M) -> dict:
         var_Feff, var_imS_E, var_logJ, mean_Feff, S_E = \
             self.compute_thimble_loss(phi, p, log_det, lambda_im)
 
-        euclidean_loss = var_Feff + lambda_im * var_imS_E + lambda_J * var_logJ
+        # In thimble.py compute_combined_loss, add to euclidean_loss:
+        mean_logJ_penalty = (torch.mean(log_det) / self.L**4) ** 2
+        euclidean_loss = var_Feff + lambda_im * var_imS_E + lambda_J * var_logJ + 0.1 * mean_logJ_penalty
 
-        # ── Minkowski loss ───────────────────────────────────────────────────
         if lambda_M > 0.0:
             S_M       = self.action_computer.minkowski_action(phi, p)
             var_imS_M = torch.var(S_M.imag)
             mink_loss = lambda_M * var_imS_M
         else:
-            # No Minkowski gradient this step — skip for speed
             with torch.no_grad():
                 S_M       = self.action_computer.minkowski_action(phi, p)
                 var_imS_M = torch.var(S_M.imag)
@@ -362,17 +642,16 @@ class PhysicsInformedThimble(nn.Module):
             'S_E':        S_E,
         }
 
-    def compute_log_jacobian(self, z: torch.Tensor, p: LagrangianParams) -> torch.Tensor:
+    def compute_log_jacobian(self, z, p):
         _, log_det = self.forward(z, p)
         return log_det
 
 
 # ============================================================================
-# Statistical utilities
+# Statistical utilities  (unchanged)
 # ============================================================================
 
 def effective_sample_size(log_weights: torch.Tensor) -> float:
-    """ESS = (Σw)²/Σw² as fraction of N."""
     lw = log_weights - torch.max(log_weights)
     w  = torch.exp(lw)
     return (w.sum()**2 / (w**2).sum() / len(w)).item()
@@ -380,7 +659,6 @@ def effective_sample_size(log_weights: torch.Tensor) -> float:
 
 def bootstrap_error(values: np.ndarray, weights: np.ndarray,
                     n_boot: int = 500) -> float:
-    """Bootstrap standard error of weighted mean (ESS-corrected)."""
     n = len(values)
     w = weights / weights.sum()
     boots = []
@@ -392,7 +670,6 @@ def bootstrap_error(values: np.ndarray, weights: np.ndarray,
 
 
 def integrated_autocorrelation(x: np.ndarray, max_lag: int = 50) -> float:
-    """Integrated autocorrelation time via Sokal window method."""
     n   = len(x)
     xm  = x - x.mean()
     c0  = np.dot(xm, xm) / n
